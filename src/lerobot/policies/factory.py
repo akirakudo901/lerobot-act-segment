@@ -339,6 +339,14 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, ACTSegmentConfig):
+        from .act_segment.processor_act_segment import make_act_segment_pre_post_processors
+
+        processors = make_act_segment_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, ACTConfig):
         from .act.processor_act import make_act_pre_post_processors
 
