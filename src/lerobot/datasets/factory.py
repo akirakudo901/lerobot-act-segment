@@ -42,6 +42,10 @@ def resolve_delta_timestamps(
         ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
             delta_timestamps against.
 
+    Policies that supervise per-frame labels over an action chunk may expose optional
+    ``label_feature_key`` and ``label_delta_indices`` attributes (e.g. ``act_segment``).
+    When present and the label key exists in the dataset, it is chunked like ``action``.
+
     Returns:
         dict[str, list] | None: A dictionary of delta_timestamps, e.g.:
             {
@@ -50,6 +54,9 @@ def resolve_delta_timestamps(
             }
             returns `None` if the resulting dict is empty.
     """
+    label_feature_key = getattr(cfg, "label_feature_key", None)
+    label_delta_indices = getattr(cfg, "label_delta_indices", None)
+
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
@@ -58,6 +65,12 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+        if (
+            label_feature_key
+            and label_delta_indices is not None
+            and key == label_feature_key
+        ):
+            delta_timestamps[key] = [i / ds_meta.fps for i in label_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

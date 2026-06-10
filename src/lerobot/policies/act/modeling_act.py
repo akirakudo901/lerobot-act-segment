@@ -396,6 +396,13 @@ class ACT(nn.Module):
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
         """
+        actions, vae_params, _decoder_out = self._forward_from_batch(batch)
+        return actions, vae_params
+
+    def _forward_from_batch(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Tensor]:
+        """Run ACT and also return decoder token features for auxiliary heads."""
         if self.config.use_vae and self.training:
             assert ACTION in batch, (
                 "actions must be provided when using the variational objective in training mode."
@@ -509,7 +516,7 @@ class ACT(nn.Module):
 
         actions = self.action_head(decoder_out)
 
-        return actions, (mu, log_sigma_x2)
+        return actions, (mu, log_sigma_x2), decoder_out
 
 
 class ACTEncoder(nn.Module):
