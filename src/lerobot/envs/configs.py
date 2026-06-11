@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 from __future__ import annotations
 
 import abc
@@ -322,6 +325,7 @@ class HILSerlRobotEnvConfig(EnvConfig):
 class LiberoEnv(EnvConfig):
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
     task_ids: list[int] | None = None
+    task_names: list[str] | None = None
     fps: int = 30
     episode_length: int | None = None
     obs_type: str = "pixels_agent_pos"
@@ -415,6 +419,8 @@ class LiberoEnv(EnvConfig):
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        if self.task_names is not None:
+            kwargs["task_names"] = self.task_names
         return kwargs
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):

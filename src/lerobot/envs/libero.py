@@ -13,6 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 from __future__ import annotations
 
 import os
@@ -55,6 +59,35 @@ def _select_task_ids(total_tasks: int, task_ids: Iterable[int] | None) -> list[i
         if t < 0 or t >= total_tasks:
             raise ValueError(f"task_id {t} out of range [0, {total_tasks - 1}].")
     return ids
+
+
+def resolve_task_ids(
+    suite: Any,
+    *,
+    task_ids: Iterable[int] | None = None,
+    task_names: Sequence[str] | None = None,
+) -> list[int]:
+    """Map ``task_ids`` and/or ``task_names`` to validated suite task indices."""
+    total_tasks = len(suite.tasks)
+    if task_ids is None and task_names is None:
+        return list(range(total_tasks))
+
+    name_to_id = {task.name: idx for idx, task in enumerate(suite.tasks)}
+    selected: set[int] = set()
+    if task_ids is not None:
+        selected.update(_select_task_ids(total_tasks, task_ids))
+    if task_names is not None:
+        for name in task_names:
+            if name not in name_to_id:
+                available = ", ".join(sorted(name_to_id))
+                raise ValueError(
+                    f"Unknown task name {name!r} in suite. Available: {available}"
+                )
+            selected.add(name_to_id[name])
+
+    if not selected:
+        raise ValueError("No tasks selected after resolving task_ids and task_names.")
+    return sorted(selected)
 
 
 # LIBERO-plus perturbation variants encode the perturbation in the filename
@@ -453,6 +486,7 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
+    task_names_filter = gym_kwargs.pop("task_names", None)
 
     camera_names = parse_camera_names(camera_name)
     suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
@@ -462,18 +496,19 @@ def create_libero_envs(
     print(
         f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} | init_states={init_states}"
     )
-    if task_ids_filter is not None:
-        print(f"Restricting to task_ids={task_ids_filter}")
+    if task_ids_filter is not None or task_names_filter is not None:
+        print(f"Restricting to task_ids={task_ids_filter} task_names={task_names_filter}")
 
     is_async = env_cls is gym.vector.AsyncVectorEnv
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for suite_name in suite_names:
         suite = _get_suite(suite_name)
-        total = len(suite.tasks)
-        selected = _select_task_ids(total, task_ids_filter)
-        if not selected:
-            raise ValueError(f"No tasks selected for suite '{suite_name}' (available: {total}).")
+        selected = resolve_task_ids(
+            suite,
+            task_ids=task_ids_filter,
+            task_names=task_names_filter,
+        )
 
         # All tasks in a suite share identical observation/action spaces.
         # Probe once and reuse to avoid creating a temp env per task.
