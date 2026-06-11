@@ -410,6 +410,42 @@ class LiberoEnv(gym.Env):
         truncated = False
         return observation, reward, terminated, truncated, info
 
+    def get_current_observation(self) -> dict[str, Any]:
+        """
+        Return formatted observation (same structure as ``step``/``reset``) without stepping
+        but following forced update of environment observables.
+        """
+        self._ensure_env()
+        assert self._env is not None
+        self._env._update_observables(force=True)
+        raw_obs = dict(self._env.env._get_observations())
+        return self._format_raw_obs(raw_obs)
+
+    def execute_ik(self, target: Any, current_ee_pose: np.ndarray) -> None:
+        """Run IK teleport MP execution inside the worker (AsyncVectorEnv-safe)."""
+        from hybrid_eval.execution.ik_pose_setter import IkPoseSetterMpExecutor
+
+        executor = IkPoseSetterMpExecutor()
+        executor.execute(
+            target,
+            current_ee_pose,
+            context={"replay_env": self},
+        )
+
+    def execute_ik_indexed(
+        self,
+        targets: Sequence[Any | None],
+        poses: Sequence[np.ndarray],
+        mask: Sequence[bool],
+    ) -> None:
+        """Worker-local IK dispatch for batched ``VectorEnv.call`` (uses ``episode_index``)."""
+        idx = int(self.episode_index)
+        if idx < 0 or idx >= len(mask):
+            return
+        if not mask[idx] or targets[idx] is None:
+            return
+        self.execute_ik(targets[idx], np.asarray(poses[idx], dtype=np.float64))
+
     def close(self):
         if self._env is not None:
             self._env.close()
