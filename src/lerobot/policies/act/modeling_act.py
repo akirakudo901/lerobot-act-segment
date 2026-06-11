@@ -138,13 +138,24 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.model(batch)[0]
         return actions
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def _resolve_sample_encoded_dist(
+        self, batch: dict[str, Tensor], sample_encoded_dist: bool | None
+    ) -> bool:
+        """Use the VAE encoder path for supervised loss (train/val), not inference."""
+        if sample_encoded_dist is not None:
+            return sample_encoded_dist
+        return self.training or ACTION in batch
+
+    def forward(
+        self, batch: dict[str, Tensor], sample_encoded_dist: bool | None = None
+    ) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
+        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch, sample_encoded_dist=sample_encoded_dist)
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
@@ -381,7 +392,9 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(
+        self, batch: dict[str, Tensor], sample_encoded_dist: bool = False
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -400,14 +413,22 @@ class ACT(nn.Module):
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
         """
-        actions, vae_params, _decoder_out = self._forward_from_batch(batch)
+        actions, vae_params, _decoder_out = self._forward_from_batch(batch, sample_encoded_dist)
         return actions, vae_params
 
     def _forward_from_batch(
-        self, batch: dict[str, Tensor]
+        self, 
+        batch: dict[str, Tensor],
+        sample_encoded_dist: bool = False
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Tensor]:
-        """Run ACT and also return decoder token features for auxiliary heads."""
-        if self.config.use_vae and self.training:
+        """
+        Run ACT and also return decoder token features for auxiliary heads.
+        
+        If `sample_encoded_dist` is true, decoder input is sampled from the encoder
+        latent output instead of the mean, with mu and log_sigma_x2 returned.
+        """
+        sample_encoded_dist = sample_encoded_dist or self.training
+        if self.config.use_vae and sample_encoded_dist:
             assert ACTION in batch, (
                 "actions must be provided when using the variational objective in training mode."
             )
@@ -415,7 +436,7 @@ class ACT(nn.Module):
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
         # Prepare the latent for input to the transformer encoder.
-        if self.config.use_vae and ACTION in batch and self.training:
+        if self.config.use_vae and ACTION in batch and sample_encoded_dist:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
             cls_embed = einops.repeat(
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
