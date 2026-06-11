@@ -255,6 +255,12 @@ class TrainPipelineConfig(HubMixin):
             self.val_dataset.repo_id == self.dataset.repo_id
             and self.val_dataset.root == self.dataset.root
         )
+        if same_dataset and self.val_dataset.episodes is None:
+            raise ValueError(
+                "When val_dataset shares repo_id+root with train, val_dataset.episodes must be "
+                "set explicitly. Use val_split_fraction for an automatic holdout, or list the "
+                "held-out episode indices in val_dataset.episodes."
+            )
         if not same_dataset:
             return
 
