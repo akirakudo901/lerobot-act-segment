@@ -37,6 +37,10 @@ class ACTSegmentConfig(ACTConfig):
     label_weight: float = 1.0
     num_label_classes: int = 4
 
+    use_hybrid_orchestrator: bool = False
+    hybrid_connector: str = "consecutive_mp"
+    mp_executor_type: str = "ik_pose_setter"
+
     @property
     def label_delta_indices(self) -> list[int]:
         return list(range(self.chunk_size))
