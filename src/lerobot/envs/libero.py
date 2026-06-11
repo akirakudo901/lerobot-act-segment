@@ -35,6 +35,7 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
+from lerobot.utils.constants import OBS_STATE, OBS_STR
 
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
@@ -409,6 +410,106 @@ class LiberoEnv(gym.Env):
             self.reset()
         truncated = False
         return observation, reward, terminated, truncated, info
+
+    def ik_obs_hook_class(self) -> type[LiberoEnv]:
+        """Return the env class that implements batched IK observation helpers for ``rollout()``."""
+        return type(self)
+
+    @staticmethod
+    def ee_poses_from_observation(
+        observation: dict[str, Any],
+        mask: Sequence[bool],
+    ) -> list[np.ndarray]:
+        """Extract pre-step 6-D EE poses (pos + axis-angle) for IK rows from the env obs batch."""
+        from hybrid_eval.connectors.action_format import ee_pose_6d
+
+        robot_state_key = f"{OBS_STR}.robot_state"
+        if robot_state_key in observation:
+            import robosuite.utils.transform_utils as T
+
+            robot_state = observation[robot_state_key]
+            eef_pos = robot_state["eef"]["pos"]
+            eef_quat = robot_state["eef"]["quat"]
+            batch_size = int(eef_pos.shape[0]) if hasattr(eef_pos, "shape") else len(eef_pos)
+            poses: list[np.ndarray] = []
+            for i in range(batch_size):
+                if not mask[i]:
+                    poses.append(np.zeros(6, dtype=np.float64))
+                    continue
+                pos = (
+                    eef_pos[i].detach().cpu().numpy()
+                    if isinstance(eef_pos, torch.Tensor)
+                    else np.asarray(eef_pos[i])
+                )
+                quat = (
+                    eef_quat[i].detach().cpu().numpy()
+                    if isinstance(eef_quat, torch.Tensor)
+                    else np.asarray(eef_quat[i])
+                )
+                ee_ori = np.asarray(T.quat2axisangle(quat), dtype=np.float64).ravel()
+                poses.append(ee_pose_6d(pos, ee_ori))
+            return poses
+
+        if OBS_STATE in observation:
+            state = observation[OBS_STATE]
+            batch_size = int(state.shape[0])
+            poses = []
+            for i in range(batch_size):
+                if not mask[i]:
+                    poses.append(np.zeros(6, dtype=np.float64))
+                    continue
+                row = (
+                    state[i].detach().cpu().numpy()
+                    if isinstance(state, torch.Tensor)
+                    else np.asarray(state[i])
+                )
+                poses.append(np.asarray(row[:6], dtype=np.float64))
+            return poses
+
+        raise KeyError(
+            f"observation must contain {robot_state_key!r} or {OBS_STATE!r} for IK pre-step EE poses"
+        )
+
+    @staticmethod
+    def _patch_observation_row(
+        observation: dict[str, np.ndarray],
+        index: int,
+        fresh: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        """Replace one batch row in a vector-env observation dict with a single-env observation."""
+        if "pixels" in fresh and "pixels" in observation:
+            for cam, img in fresh["pixels"].items():
+                if cam in observation["pixels"]:
+                    observation["pixels"][cam][index] = np.asarray(img)
+
+        if "robot_state" in fresh and "robot_state" in observation:
+            for group in ("eef", "gripper", "joints"):
+                if group not in fresh["robot_state"] or group not in observation["robot_state"]:
+                    continue
+                for key, value in fresh["robot_state"][group].items():
+                    if key in observation["robot_state"][group]:
+                        observation["robot_state"][group][key][index] = np.asarray(value)
+        return observation
+
+    @staticmethod
+    def patch_observation_after_ik(
+        env: gym.vector.VectorEnv,
+        observation: dict[str, np.ndarray],
+        mask: Sequence[bool],
+    ) -> dict[str, np.ndarray]:
+        """Refresh batch rows that received post-step IK via worker formatted observations."""
+        if not any(mask):
+            return observation
+
+        try:
+            formatted_list = list(env.call("get_current_observation"))
+        except (AttributeError, NotImplementedError):
+            return observation
+
+        for i, active in enumerate(mask):
+            if active:
+                observation = LiberoEnv._patch_observation_row(observation, i, formatted_list[i])
+        return observation
 
     def get_current_observation(self) -> dict[str, Any]:
         """
