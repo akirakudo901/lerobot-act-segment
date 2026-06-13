@@ -40,6 +40,9 @@ class ACTSegmentConfig(ACTConfig):
     use_hybrid_orchestrator: bool = False
     hybrid_connector: str = "consecutive_mp"
     mp_executor_type: str = "ik_pose_setter"
+    # ``full_chunk``: execute all ``n_action_steps`` before refill.
+    # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
+    hybrid_refill_mode: str = "full_chunk"
 
     @property
     def label_delta_indices(self) -> list[int]:

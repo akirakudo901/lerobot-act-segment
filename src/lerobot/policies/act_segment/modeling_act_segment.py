@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -112,7 +112,8 @@ class ACTSegmentPolicy(ACTPolicy):
         self._select_action_batchsize: int = None
         self._chunk_actions: Tensor | None = None
         self._chunk_labels: Tensor | None = None
-        self._chunk_t = 0
+        self._chunk_t: list[int] = []
+        self._chunk_horizons: list[int] = []
         self._targets_by_frame: list[dict[int, PlanningTarget]] = []
         self._executed_target_ids: list[set[int]] = []
         self._ik_pending: IkPending | None = None
@@ -187,33 +188,91 @@ class ACTSegmentPolicy(ACTPolicy):
      
         return self._select_action_hybrid(batch)
 
-    def _refill_hybrid_chunk(self, batch: dict[str, Tensor]) -> None:
+    def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
+        from dataset.core.frame_labels import FrameLabelEnum
+
+        for t in range(labels_row.shape[0]):
+            if FrameLabelEnum.is_mp_frame_label(int(labels_row[t].item())):
+                return t + 1
+        return self.config.n_action_steps
+
+    def _refill_hybrid_rows(self, batch: dict[str, Tensor], rows: Sequence[int]) -> None:
+        """
+        Recompute (refill) action and label chunk rows for the hybrid orchestrator.
+        
+        If called while `self._chunk_actions` is None, `rows` must cover the entire batch (0..batch_size-1), 
+        otherwise throws a ValueError. This ensures we fill the full set of per-row memory.
+        """
         assert self._connector is not None
         from hybrid_eval.eval.hybrid_rollout import group_targets_by_execution_frame
 
-        actions, labels = self.predict_action_label_chunk(batch)
+        # Remove duplicates and sort rows ascending
+        rows = sorted(set(rows))
+        batch_size = self._select_action_batchsize
+
+        # Check for full batch coverage on first call if chunk actions are not yet initialized
+        if self._chunk_actions is None and rows != list(range(batch_size)):
+            raise ValueError(
+                "On first call to _refill_hybrid_rows, rows must be the full batch range "
+                f"(0..{batch_size - 1}) but got {rows}."
+            )
+
+        # Only run prediction for the requested rows, efficiently batching if possible
+        if len(rows) == 0:
+            return
+
+        # Build mini-batch for inference
+        # Check that values are tensors before indexing
+        per_row_batch = {
+            k: (v[rows] if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
+        actions, labels = self.predict_action_label_chunk(per_row_batch)
         actions = actions[:, : self.config.n_action_steps]
         labels = labels[:, : self.config.n_action_steps]
-        self._chunk_actions = actions
-        self._chunk_labels = labels
-        self._chunk_t = 0
-        self._targets_by_frame = []
-        self._executed_target_ids = []
 
-        batch_size = self._select_action_batchsize
-        for row in range(batch_size):
-            actions_np = actions[row].detach().cpu().numpy()
-            labels_np = labels[row].detach().cpu().numpy()
+        # Initialize storage structures if needed
+        if self._chunk_actions is None:
+            self._chunk_actions = actions.clone()
+            self._chunk_labels = labels.clone()
+            self._targets_by_frame = [{} for _ in range(batch_size)]
+            self._executed_target_ids = [set() for _ in range(batch_size)]
+            self._chunk_t = [0] * batch_size
+            self._chunk_horizons = [self.config.n_action_steps] * batch_size
+
+        # Now update only requested rows with fresh chunk
+        for i, row in enumerate(rows):
+            horizon = (
+                self._effective_chunk_horizon(labels[i])
+                if self.config.hybrid_refill_mode == "until_first_mp"
+                else self.config.n_action_steps
+            )
+            self._chunk_actions[row] = actions[i]
+            self._chunk_labels[row] = labels[i]
+            self._chunk_horizons[row] = horizon
+            self._chunk_t[row] = 0
+
+            actions_np = actions[i].detach().cpu().numpy()
+            labels_np = labels[i].detach().cpu().numpy()
             targets = self._connector.planning_targets(actions_np, labels_np)
-            self._targets_by_frame.append(group_targets_by_execution_frame(targets))
-            self._executed_target_ids.append(set())
+            grouped = group_targets_by_execution_frame(targets)
+            self._targets_by_frame[row] = {frame: target for frame, target in grouped.items() if frame < horizon}
+            self._executed_target_ids[row] = set()
 
     @torch.no_grad()
     def _select_action_hybrid(self, batch: dict[str, Tensor]) -> Tensor:
         from dataset.core.frame_labels import FrameLabelEnum
 
-        if self._chunk_actions is None or self._chunk_t >= self.config.n_action_steps:
-            self._refill_hybrid_chunk(batch)
+        batch_size = self._select_action_batchsize
+
+        if self._chunk_actions is None:
+            rows_to_refill = list(range(batch_size))
+        else:
+            rows_to_refill = [
+                row for row in range(batch_size) if self._chunk_t[row] >= self._chunk_horizons[row]
+            ]
+        if rows_to_refill:
+            self._refill_hybrid_rows(batch, rows_to_refill)
 
         assert self._chunk_actions is not None
         assert self._chunk_labels is not None
@@ -228,8 +287,8 @@ class ACTSegmentPolicy(ACTPolicy):
         ik_targets: list[Any | None] = [None] * batch_size
         ik_mask = [False] * batch_size
 
-        chunk_t = self._chunk_t
         for row in range(batch_size):
+            chunk_t = self._chunk_t[row]
             target = self._targets_by_frame[row].get(chunk_t)
             label = int(self._chunk_labels[row, chunk_t].item())
 
@@ -248,8 +307,9 @@ class ACTSegmentPolicy(ACTPolicy):
             else:
                 raise ValueError(f"unknown frame label {label!r} at chunk index {chunk_t}")
 
+            self._chunk_t[row] += 1
+
         self._ik_pending = IkPending(targets=ik_targets, mask=ik_mask)
-        self._chunk_t += 1
         return actions_out
 
     def forward(
