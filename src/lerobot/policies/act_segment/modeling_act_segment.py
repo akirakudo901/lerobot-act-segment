@@ -109,6 +109,7 @@ class ACTSegmentPolicy(ACTPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+        self._select_action_batchsize: int = None
         self._chunk_actions: Tensor | None = None
         self._chunk_labels: Tensor | None = None
         self._chunk_t = 0
@@ -170,6 +171,20 @@ class ACTSegmentPolicy(ACTPolicy):
         """Select one action per env; hybrid orchestrator routes MP triggers to dummy IK steps."""
         if not self.config.use_hybrid_orchestrator:
             return super().select_action(batch)
+        
+        # Extract the batch size from the 'batch' dict, assuming any tensor value
+        first_tensor = next(v for v in batch.values() if isinstance(v, torch.Tensor))
+        actual_batch_size = first_tensor.shape[0]
+            
+        # we fix a batch size for ```select_action``` that is fixed until policy is reset
+        if self._select_action_batchsize is None:
+            self._select_action_batchsize = actual_batch_size
+        elif self._select_action_batchsize != actual_batch_size:
+            raise ValueError(
+                f"Batch size mismatch in select_action: expected {self._select_action_batchsize}, "
+                f"but got {actual_batch_size}. Batch size must remain fixed across calls until reset."
+            )
+     
         return self._select_action_hybrid(batch)
 
     def _refill_hybrid_chunk(self, batch: dict[str, Tensor]) -> None:
@@ -185,7 +200,7 @@ class ACTSegmentPolicy(ACTPolicy):
         self._targets_by_frame = []
         self._executed_target_ids = []
 
-        batch_size = actions.shape[0]
+        batch_size = self._select_action_batchsize
         for row in range(batch_size):
             actions_np = actions[row].detach().cpu().numpy()
             labels_np = labels[row].detach().cpu().numpy()
@@ -203,7 +218,7 @@ class ACTSegmentPolicy(ACTPolicy):
         assert self._chunk_actions is not None
         assert self._chunk_labels is not None
 
-        batch_size = self._chunk_actions.shape[0]
+        batch_size = self._select_action_batchsize
         action_dim = self._chunk_actions.shape[-1]
         device = self._chunk_actions.device
         dtype = self._chunk_actions.dtype
