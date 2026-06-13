@@ -526,7 +526,21 @@ class LiberoEnv(gym.Env):
         """Run IK teleport MP execution inside the worker (AsyncVectorEnv-safe)."""
         from hybrid_eval.execution.ik_pose_setter import IkPoseSetterMpExecutor
 
-        executor = IkPoseSetterMpExecutor()
+        # TODO: ADD A CONFIG FOR THIS AS A SUBCONFIG TO ACTSegmentPolicy
+        executor = IkPoseSetterMpExecutor(
+            ik_max_iters=1000,
+            ik_pos_tol=1e-2,
+            ik_ori_tol=3e-2,
+            ik_damping=5e-2,
+            ik_null_space_gain=0,
+            ik_null_space_fade_err=0.05,
+            ik_waypoint_max_step_m=0.1,
+            ik_max_waypoints=20,
+            ik_optimize_position_first=False,
+            ik_ori_weight=1.0,
+            on_ik_failure="best_guess",
+            collect_ik_traces=False,
+        )
         executor.execute(
             target,
             current_ee_pose,
