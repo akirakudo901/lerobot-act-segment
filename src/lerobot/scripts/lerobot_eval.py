@@ -61,7 +61,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from pprint import pformat
@@ -104,6 +104,29 @@ def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
         return env.call("ik_obs_hook_class")[0]
     except (AttributeError, NotImplementedError, IndexError, TypeError):
         return None
+
+
+def _postprocess_ik_pending_targets(
+    ik_pending: Any,
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+) -> Any:
+    """Unnormalize ``PlanningTarget.action`` rows stashed for MP IK execution."""
+    from hybrid_eval.connectors.planning_target import PlanningTarget
+
+    postprocessed_targets: list[PlanningTarget | None] = []
+    for target in ik_pending.targets:
+        if target is None:
+            postprocessed_targets.append(None)
+            continue
+        action_tensor = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
+        action_tensor = postprocessor(action_tensor)
+        action_np = (
+            action_tensor.squeeze(0).detach().cpu().numpy().astype(np.float64, copy=False)
+        )
+        postprocessed_targets.append(replace(target, action=action_np))
+
+    ik_pending.targets = postprocessed_targets
+    return ik_pending
 
 
 def rollout(
@@ -205,7 +228,10 @@ def rollout(
         if ik_pending is not None and ik_obs_hook is not None:
             pre_step_poses = ik_obs_hook.ee_poses_from_observation(env_preprocessed_obs, ik_pending.mask)
 
+        # Policy outputs are in normalized space; unnormalize before env control and IK.
         action = postprocessor(action)
+        if ik_pending is not None:
+            ik_pending = _postprocess_ik_pending_targets(ik_pending, postprocessor)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)

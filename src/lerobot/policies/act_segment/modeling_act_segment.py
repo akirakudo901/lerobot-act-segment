@@ -43,7 +43,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class IkPending:
-    """Batched IK targets stashed during ``select_action`` for the rollout hook."""
+    """Batched IK targets stashed during ``select_action`` for the rollout hook.
+
+    Each ``PlanningTarget.action`` is in policy output space (normalized). The eval
+    rollout must run the policy postprocessor on both the returned step action and
+    these stored actions before ``env.step`` / ``IkPoseSetterMpExecutor`` execution.
+    """
 
     targets: list[PlanningTarget | None]
     mask: list[bool]
@@ -252,6 +257,8 @@ class ACTSegmentPolicy(ACTPolicy):
             self._chunk_horizons[row] = horizon
             self._chunk_t[row] = 0
 
+            # Connector copies policy-output actions into PlanningTarget; unnormalization
+            # must happen in the eval rollout alongside the per-step select_action output.
             actions_np = actions[i].detach().cpu().numpy()
             labels_np = labels[i].detach().cpu().numpy()
             targets = self._connector.planning_targets(actions_np, labels_np)
@@ -294,6 +301,8 @@ class ACTSegmentPolicy(ACTPolicy):
 
             if target is not None and id(target) not in self._executed_target_ids[row]:
                 if self.config.mp_executor_type == "ik_pose_setter":
+                    # Dummy OSC action for this step; the real MP motion comes from
+                    # ``IkPending`` targets postprocessed in the eval rollout loop.
                     actions_out[row] = dummy
                     ik_targets[row] = target
                     ik_mask[row] = True
