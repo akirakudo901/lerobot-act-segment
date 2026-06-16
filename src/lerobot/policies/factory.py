@@ -323,6 +323,10 @@ def make_pre_post_processors(
             to_output=transition_to_policy_action,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if isinstance(policy_cfg, ACTSegmentConfig):
+            from .act_segment.processor_act_segment import prepend_act_segment_state_layout_step
+
+            preprocessor = prepend_act_segment_state_layout_step(preprocessor, policy_cfg)
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type

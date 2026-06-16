@@ -44,6 +44,12 @@ class ACTSegmentConfig(ACTConfig):
     # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
     hybrid_refill_mode: str = "full_chunk"
 
+    # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
+    # Default ``None``: no reordering. Set explicitly when eval env layout differs from training, e.g.
+    # ``efficient_libero`` for policies trained on efficient LIBERO exports
+    # (gripper + ee_pos + ee_ori instead of LIBERO's ee_pos + axis-angle + gripper).
+    observation_state_layout: str | None = None
+
     @property
     def label_delta_indices(self) -> list[int]:
         return list(range(self.chunk_size))
