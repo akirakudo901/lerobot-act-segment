@@ -49,6 +49,9 @@ Note that in both examples, the repo/folder should contain at least `config.json
 You can learn about the CLI options for this script in the `EvalPipelineConfig` in lerobot/configs/eval.py
 """
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 import concurrent.futures as cf
 import json
 import logging
@@ -58,7 +61,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from pprint import pformat
@@ -93,6 +96,37 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
+    """Return the env class providing batched IK observation helpers, if any."""
+    try:
+        return env.call("ik_obs_hook_class")[0]
+    except (AttributeError, NotImplementedError, IndexError, TypeError):
+        return None
+
+
+def _postprocess_ik_pending_targets(
+    ik_pending: Any,
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+) -> Any:
+    """Unnormalize ``PlanningTarget.action`` rows stashed for MP IK execution."""
+    from hybrid_eval.connectors.planning_target import PlanningTarget
+
+    postprocessed_targets: list[PlanningTarget | None] = []
+    for target in ik_pending.targets:
+        if target is None:
+            postprocessed_targets.append(None)
+            continue
+        action_tensor = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
+        action_tensor = postprocessor(action_tensor)
+        action_np = (
+            action_tensor.squeeze(0).detach().cpu().numpy().astype(np.float64, copy=False)
+        )
+        postprocessed_targets.append(replace(target, action=action_np))
+
+    ik_pending.targets = postprocessed_targets
+    return ik_pending
 
 
 def rollout(
@@ -180,11 +214,24 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
+        env_preprocessed_obs = observation
 
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
+        
+        # Hybrid-motion-planner extension (akirakudo901): execute inverse kinematics "jump" for applicable environments
+        consume_ik = getattr(policy, "consume_ik_pending", None)
+        ik_pending = consume_ik() if callable(consume_ik) else None
+        pre_step_poses: list[np.ndarray] | None = None
+        ik_obs_hook = _ik_obs_hook_class(env) if ik_pending is not None else None
+        if ik_pending is not None and ik_obs_hook is not None:
+            pre_step_poses = ik_obs_hook.ee_poses_from_observation(env_preprocessed_obs, ik_pending.mask)
+
+        # Policy outputs are in normalized space; unnormalize before env control and IK.
         action = postprocessor(action)
+        if ik_pending is not None:
+            ik_pending = _postprocess_ik_pending_targets(ik_pending, postprocessor)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
@@ -196,6 +243,11 @@ def rollout(
 
         # Apply the next action.
         observation, reward, terminated, truncated, info = env.step(action_numpy)
+
+        if ik_pending is not None and pre_step_poses is not None and ik_obs_hook is not None:
+            env.call("execute_ik_indexed", ik_pending.targets, pre_step_poses, ik_pending.mask)
+            observation = ik_obs_hook.patch_observation_after_ik(env, observation, ik_pending.mask)
+
         if render_callback is not None:
             render_callback(env)
 

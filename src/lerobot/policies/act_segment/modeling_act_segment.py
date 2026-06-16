@@ -19,17 +19,39 @@
 
 """ACT with a per-chunk-step segment label classification head."""
 
+from __future__ import annotations
+
 from collections import deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.envs.libero import get_libero_dummy_action
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 from ..act.modeling_act import ACT, ACTPolicy, ACTTemporalEnsembler
 from ..pretrained import PreTrainedPolicy
 from .configuration_act_segment import ACTSegmentConfig
+
+if TYPE_CHECKING:
+    from hybrid_eval.connectors.planning_target import PlanningTarget
+    from hybrid_eval.protocols import MpSegmentConnector
+
+
+@dataclass
+class IkPending:
+    """Batched IK targets stashed during ``select_action`` for the rollout hook.
+
+    Each ``PlanningTarget.action`` is in policy output space (normalized). The eval
+    rollout must run the policy postprocessor on both the returned step action and
+    these stored actions before ``env.step`` / ``IkPoseSetterMpExecutor`` execution.
+    """
+
+    targets: list[PlanningTarget | None]
+    mask: list[bool]
 
 
 class ACTSegment(ACT):
@@ -59,10 +81,55 @@ class ACTSegmentPolicy(ACTPolicy):
         self.config = config
         self.model = ACTSegment(config)
 
+        if config.use_hybrid_orchestrator and config.temporal_ensemble_coeff is not None:
+            raise ValueError(
+                "use_hybrid_orchestrator is incompatible with temporal_ensemble_coeff"
+            )
+
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
+        self._connector: MpSegmentConnector | None = None
+        if config.use_hybrid_orchestrator:
+            self._connector = self._make_hybrid_connector()
+
         self.reset()
+
+    def _make_hybrid_connector(self) -> MpSegmentConnector:
+        from hybrid_eval.connectors import ConsecutiveMpConnector, SegmentEndpointsConnector
+
+        name = self.config.hybrid_connector
+        if name == "consecutive_mp":
+            return ConsecutiveMpConnector()
+        if name == "segment_endpoints":
+            return SegmentEndpointsConnector()
+        raise ValueError(
+            f"Unknown hybrid_connector {name!r}; expected 'consecutive_mp' or 'segment_endpoints'"
+        )
+
+    def reset(self):
+        """Clear ACT queues and hybrid orchestrator chunk state."""
+        if self.config.temporal_ensemble_coeff is not None:
+            self.temporal_ensembler.reset()
+        else:
+            self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+        self._select_action_batchsize: int = None
+        self._chunk_actions: Tensor | None = None
+        self._chunk_labels: Tensor | None = None
+        self._chunk_t: list[int] = []
+        self._chunk_horizons: list[int] = []
+        self._targets_by_frame: list[dict[int, PlanningTarget]] = []
+        self._executed_target_ids: list[set[int]] = []
+        self._ik_pending: IkPending | None = None
+
+    def consume_ik_pending(self) -> IkPending | None:
+        """Return and clear IK targets from the last ``select_action`` call."""
+        pending = self._ik_pending
+        self._ik_pending = None
+        if pending is None or not any(pending.mask):
+            return None
+        return pending
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.image_features:
@@ -96,6 +163,163 @@ class ACTSegmentPolicy(ACTPolicy):
         batch = self._prepare_batch(batch)
         _actions, labels_logits, _vae_params = self.model(batch)
         return labels_logits.argmax(dim=-1)
+    
+    @torch.no_grad()
+    def predict_action_label_chunk(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Return both the actions and argmax segment labels for each step in the predicted chunk."""
+        self.eval()
+        batch = self._prepare_batch(batch)
+        actions, labels_logits, _vae_params = self.model(batch)
+        return actions, labels_logits.argmax(dim=-1)
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+        """Select one action per env; hybrid orchestrator routes MP triggers to dummy IK steps."""
+        if not self.config.use_hybrid_orchestrator:
+            return super().select_action(batch)
+        
+        # Extract the batch size from the 'batch' dict, assuming any tensor value
+        first_tensor = next(v for v in batch.values() if isinstance(v, torch.Tensor))
+        actual_batch_size = first_tensor.shape[0]
+            
+        # we fix a batch size for ```select_action``` that is fixed until policy is reset
+        if self._select_action_batchsize is None:
+            self._select_action_batchsize = actual_batch_size
+        elif self._select_action_batchsize != actual_batch_size:
+            raise ValueError(
+                f"Batch size mismatch in select_action: expected {self._select_action_batchsize}, "
+                f"but got {actual_batch_size}. Batch size must remain fixed across calls until reset."
+            )
+     
+        return self._select_action_hybrid(batch)
+
+    def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
+        from dataset.core.frame_labels import FrameLabelEnum
+
+        for t in range(labels_row.shape[0]):
+            if FrameLabelEnum.is_mp_frame_label(int(labels_row[t].item())):
+                return t + 1
+        return self.config.n_action_steps
+
+    def _refill_hybrid_rows(self, batch: dict[str, Tensor], rows: Sequence[int]) -> None:
+        """
+        Recompute (refill) action and label chunk rows for the hybrid orchestrator.
+        
+        If called while `self._chunk_actions` is None, `rows` must cover the entire batch (0..batch_size-1), 
+        otherwise throws a ValueError. This ensures we fill the full set of per-row memory.
+        """
+        assert self._connector is not None
+        from hybrid_eval.eval.hybrid_rollout import group_targets_by_execution_frame
+
+        # Remove duplicates and sort rows ascending
+        rows = sorted(set(rows))
+        batch_size = self._select_action_batchsize
+
+        # Check for full batch coverage on first call if chunk actions are not yet initialized
+        if self._chunk_actions is None and rows != list(range(batch_size)):
+            raise ValueError(
+                "On first call to _refill_hybrid_rows, rows must be the full batch range "
+                f"(0..{batch_size - 1}) but got {rows}."
+            )
+
+        # Only run prediction for the requested rows, efficiently batching if possible
+        if len(rows) == 0:
+            return
+
+        # Build mini-batch for inference
+        # Check that values are tensors before indexing
+        per_row_batch = {
+            k: (v[rows] if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
+        actions, labels = self.predict_action_label_chunk(per_row_batch)
+        actions = actions[:, : self.config.n_action_steps]
+        labels = labels[:, : self.config.n_action_steps]
+
+        # Initialize storage structures if needed
+        if self._chunk_actions is None:
+            self._chunk_actions = actions.clone()
+            self._chunk_labels = labels.clone()
+            self._targets_by_frame = [{} for _ in range(batch_size)]
+            self._executed_target_ids = [set() for _ in range(batch_size)]
+            self._chunk_t = [0] * batch_size
+            self._chunk_horizons = [self.config.n_action_steps] * batch_size
+
+        # Now update only requested rows with fresh chunk
+        for i, row in enumerate(rows):
+            horizon = (
+                self._effective_chunk_horizon(labels[i])
+                if self.config.hybrid_refill_mode == "until_first_mp"
+                else self.config.n_action_steps
+            )
+            self._chunk_actions[row] = actions[i]
+            self._chunk_labels[row] = labels[i]
+            self._chunk_horizons[row] = horizon
+            self._chunk_t[row] = 0
+
+            # Connector copies policy-output actions into PlanningTarget; unnormalization
+            # must happen in the eval rollout alongside the per-step select_action output.
+            actions_np = actions[i].detach().cpu().numpy()
+            labels_np = labels[i].detach().cpu().numpy()
+            targets = self._connector.planning_targets(actions_np, labels_np)
+            grouped = group_targets_by_execution_frame(targets)
+            self._targets_by_frame[row] = {frame: target for frame, target in grouped.items() if frame < horizon}
+            self._executed_target_ids[row] = set()
+
+    @torch.no_grad()
+    def _select_action_hybrid(self, batch: dict[str, Tensor]) -> Tensor:
+        from dataset.core.frame_labels import FrameLabelEnum
+
+        batch_size = self._select_action_batchsize
+
+        if self._chunk_actions is None:
+            rows_to_refill = list(range(batch_size))
+        else:
+            rows_to_refill = [
+                row for row in range(batch_size) if self._chunk_t[row] >= self._chunk_horizons[row]
+            ]
+        if rows_to_refill:
+            self._refill_hybrid_rows(batch, rows_to_refill)
+
+        assert self._chunk_actions is not None
+        assert self._chunk_labels is not None
+
+        batch_size = self._select_action_batchsize
+        action_dim = self._chunk_actions.shape[-1]
+        device = self._chunk_actions.device
+        dtype = self._chunk_actions.dtype
+        dummy = torch.tensor(get_libero_dummy_action(), device=device, dtype=dtype)
+
+        actions_out = torch.empty(batch_size, action_dim, device=device, dtype=dtype)
+        ik_targets: list[Any | None] = [None] * batch_size
+        ik_mask = [False] * batch_size
+
+        for row in range(batch_size):
+            chunk_t = self._chunk_t[row]
+            target = self._targets_by_frame[row].get(chunk_t)
+            label = int(self._chunk_labels[row, chunk_t].item())
+
+            if target is not None and id(target) not in self._executed_target_ids[row]:
+                if self.config.mp_executor_type == "ik_pose_setter":
+                    # Dummy OSC action for this step; the real MP motion comes from
+                    # ``IkPending`` targets postprocessed in the eval rollout loop.
+                    actions_out[row] = dummy
+                    ik_targets[row] = target
+                    ik_mask[row] = True
+                    self._executed_target_ids[row].add(id(target))
+                else:
+                    raise NotImplementedError(
+                        f"mp_executor_type {self.config.mp_executor_type!r} is not supported yet"
+                    )
+            elif FrameLabelEnum.is_l_frame_label(label) or FrameLabelEnum.is_mp_frame_label(label):
+                actions_out[row] = self._chunk_actions[row, chunk_t]
+            else:
+                raise ValueError(f"unknown frame label {label!r} at chunk index {chunk_t}")
+
+            self._chunk_t[row] += 1
+
+        self._ik_pending = IkPending(targets=ik_targets, mask=ik_mask)
+        return actions_out
 
     def forward(
         self,

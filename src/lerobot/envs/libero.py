@@ -13,6 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 from __future__ import annotations
 
 import os
@@ -31,6 +35,7 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
+from lerobot.utils.constants import OBS_STATE, OBS_STR
 
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
@@ -55,6 +60,35 @@ def _select_task_ids(total_tasks: int, task_ids: Iterable[int] | None) -> list[i
         if t < 0 or t >= total_tasks:
             raise ValueError(f"task_id {t} out of range [0, {total_tasks - 1}].")
     return ids
+
+
+def resolve_task_ids(
+    suite: Any,
+    *,
+    task_ids: Iterable[int] | None = None,
+    task_names: Sequence[str] | None = None,
+) -> list[int]:
+    """Map ``task_ids`` and/or ``task_names`` to validated suite task indices."""
+    total_tasks = len(suite.tasks)
+    if task_ids is None and task_names is None:
+        return list(range(total_tasks))
+
+    name_to_id = {task.name: idx for idx, task in enumerate(suite.tasks)}
+    selected: set[int] = set()
+    if task_ids is not None:
+        selected.update(_select_task_ids(total_tasks, task_ids))
+    if task_names is not None:
+        for name in task_names:
+            if name not in name_to_id:
+                available = ", ".join(sorted(name_to_id))
+                raise ValueError(
+                    f"Unknown task name {name!r} in suite. Available: {available}"
+                )
+            selected.add(name_to_id[name])
+
+    if not selected:
+        raise ValueError("No tasks selected after resolving task_ids and task_names.")
+    return sorted(selected)
 
 
 # LIBERO-plus perturbation variants encode the perturbation in the filename
@@ -377,6 +411,156 @@ class LiberoEnv(gym.Env):
         truncated = False
         return observation, reward, terminated, truncated, info
 
+    def ik_obs_hook_class(self) -> type[LiberoEnv]:
+        """Return the env class that implements batched IK observation helpers for ``rollout()``."""
+        return type(self)
+
+    @staticmethod
+    def ee_poses_from_observation(
+        observation: dict[str, Any],
+        mask: Sequence[bool],
+    ) -> list[np.ndarray]:
+        """Extract pre-step 6-D EE poses (pos + axis-angle) for IK rows from the env obs batch."""
+        from hybrid_eval.connectors.action_format import ee_pose_6d
+
+        robot_state_key = f"{OBS_STR}.robot_state"
+        if robot_state_key in observation:
+            import robosuite.utils.transform_utils as T
+
+            robot_state = observation[robot_state_key]
+            eef_pos = robot_state["eef"]["pos"]
+            eef_quat = robot_state["eef"]["quat"]
+            batch_size = int(eef_pos.shape[0]) if hasattr(eef_pos, "shape") else len(eef_pos)
+            poses: list[np.ndarray] = []
+            for i in range(batch_size):
+                if not mask[i]:
+                    poses.append(np.zeros(6, dtype=np.float64))
+                    continue
+                pos = (
+                    eef_pos[i].detach().cpu().numpy()
+                    if isinstance(eef_pos, torch.Tensor)
+                    else np.asarray(eef_pos[i])
+                )
+                quat = (
+                    eef_quat[i].detach().cpu().numpy()
+                    if isinstance(eef_quat, torch.Tensor)
+                    else np.asarray(eef_quat[i])
+                )
+                ee_ori = np.asarray(T.quat2axisangle(quat), dtype=np.float64).ravel()
+                poses.append(ee_pose_6d(pos, ee_ori))
+            return poses
+
+        if OBS_STATE in observation:
+            state = observation[OBS_STATE]
+            batch_size = int(state.shape[0])
+            poses = []
+            for i in range(batch_size):
+                if not mask[i]:
+                    poses.append(np.zeros(6, dtype=np.float64))
+                    continue
+                row = (
+                    state[i].detach().cpu().numpy()
+                    if isinstance(state, torch.Tensor)
+                    else np.asarray(state[i])
+                )
+                poses.append(np.asarray(row[:6], dtype=np.float64))
+            return poses
+
+        raise KeyError(
+            f"observation must contain {robot_state_key!r} or {OBS_STATE!r} for IK pre-step EE poses"
+        )
+
+    @staticmethod
+    def _patch_observation_row(
+        observation: dict[str, np.ndarray],
+        index: int,
+        fresh: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        """Replace one batch row in a vector-env observation dict with a single-env observation."""
+        if "pixels" in fresh and "pixels" in observation:
+            for cam, img in fresh["pixels"].items():
+                if cam in observation["pixels"]:
+                    observation["pixels"][cam][index] = np.asarray(img)
+
+        if "robot_state" in fresh and "robot_state" in observation:
+            for group in ("eef", "gripper", "joints"):
+                if group not in fresh["robot_state"] or group not in observation["robot_state"]:
+                    continue
+                for key, value in fresh["robot_state"][group].items():
+                    if key in observation["robot_state"][group]:
+                        observation["robot_state"][group][key][index] = np.asarray(value)
+        return observation
+
+    @staticmethod
+    def patch_observation_after_ik(
+        env: gym.vector.VectorEnv,
+        observation: dict[str, np.ndarray],
+        mask: Sequence[bool],
+    ) -> dict[str, np.ndarray]:
+        """Refresh batch rows that received post-step IK via worker formatted observations."""
+        if not any(mask):
+            return observation
+
+        try:
+            formatted_list = list(env.call("get_current_observation"))
+        except (AttributeError, NotImplementedError):
+            return observation
+
+        for i, active in enumerate(mask):
+            if active:
+                observation = LiberoEnv._patch_observation_row(observation, i, formatted_list[i])
+        return observation
+
+    def get_current_observation(self) -> dict[str, Any]:
+        """
+        Return formatted observation (same structure as ``step``/``reset``) without stepping
+        but following forced update of environment observables.
+        """
+        self._ensure_env()
+        assert self._env is not None
+        self._env._update_observables(force=True)
+        raw_obs = dict(self._env.env._get_observations())
+        return self._format_raw_obs(raw_obs)
+
+    def execute_ik(self, target: Any, current_ee_pose: np.ndarray) -> None:
+        """Run IK teleport MP execution inside the worker (AsyncVectorEnv-safe)."""
+        from hybrid_eval.execution.ik_pose_setter import IkPoseSetterMpExecutor
+
+        # TODO: ADD A CONFIG FOR THIS AS A SUBCONFIG TO ACTSegmentPolicy
+        executor = IkPoseSetterMpExecutor(
+            ik_max_iters=1000,
+            ik_pos_tol=1e-2,
+            ik_ori_tol=3e-2,
+            ik_damping=5e-2,
+            ik_null_space_gain=0,
+            ik_null_space_fade_err=0.05,
+            ik_waypoint_max_step_m=0.1,
+            ik_max_waypoints=20,
+            ik_optimize_position_first=False,
+            ik_ori_weight=1.0,
+            on_ik_failure="best_guess",
+            collect_ik_traces=False,
+        )
+        executor.execute(
+            target,
+            current_ee_pose,
+            context={"replay_env": self},
+        )
+
+    def execute_ik_indexed(
+        self,
+        targets: Sequence[Any | None],
+        poses: Sequence[np.ndarray],
+        mask: Sequence[bool],
+    ) -> None:
+        """Worker-local IK dispatch for batched ``VectorEnv.call`` (uses ``episode_index``)."""
+        idx = int(self.episode_index)
+        if idx < 0 or idx >= len(mask):
+            return
+        if not mask[idx] or targets[idx] is None:
+            return
+        self.execute_ik(targets[idx], np.asarray(poses[idx], dtype=np.float64))
+
     def close(self):
         if self._env is not None:
             self._env.close()
@@ -453,6 +637,7 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
+    task_names_filter = gym_kwargs.pop("task_names", None)
 
     camera_names = parse_camera_names(camera_name)
     suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
@@ -462,18 +647,19 @@ def create_libero_envs(
     print(
         f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} | init_states={init_states}"
     )
-    if task_ids_filter is not None:
-        print(f"Restricting to task_ids={task_ids_filter}")
+    if task_ids_filter is not None or task_names_filter is not None:
+        print(f"Restricting to task_ids={task_ids_filter} task_names={task_names_filter}")
 
     is_async = env_cls is gym.vector.AsyncVectorEnv
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for suite_name in suite_names:
         suite = _get_suite(suite_name)
-        total = len(suite.tasks)
-        selected = _select_task_ids(total, task_ids_filter)
-        if not selected:
-            raise ValueError(f"No tasks selected for suite '{suite_name}' (available: {total}).")
+        selected = resolve_task_ids(
+            suite,
+            task_ids=task_ids_filter,
+            task_names=task_names_filter,
+        )
 
         # All tasks in a suite share identical observation/action spaces.
         # Probe once and reuse to avoid creating a temp env per task.
