@@ -18,6 +18,9 @@
 Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wandb extras)
 """
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 import dataclasses
 import logging
 import time
@@ -33,6 +36,7 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from lerobot.common.offline_eval_utils import compute_offline_val_loss, resolve_train_val_episodes
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -43,7 +47,8 @@ from lerobot.common.train_utils import (
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets import EpisodeAwareSampler, make_dataset
+from lerobot.datasets import EpisodeAwareSampler, make_dataset, make_val_dataset
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
@@ -233,6 +238,28 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
+    val_episodes_resolved: list[int] | None = None
+    if cfg.val_freq > 0 and not cfg.is_reward_model_training:
+        if is_main_process:
+            logging.info("Resolving train/val episode split")
+        ds_meta_for_split = LeRobotDatasetMetadata(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            revision=cfg.dataset.revision,
+        )
+        train_eps, val_eps = resolve_train_val_episodes(
+            cfg.dataset.episodes,
+            ds_meta_for_split.total_episodes,
+            val_split_fraction=cfg.val_split_fraction,
+            val_episodes=cfg.val_dataset.episodes if cfg.val_dataset else None,
+            seed=cfg.seed if cfg.seed is not None else 0,
+        )
+        if cfg.val_split_fraction is not None:
+            cfg.dataset.episodes = train_eps
+            val_episodes_resolved = val_eps
+        elif cfg.val_dataset is not None and cfg.val_dataset.episodes is not None:
+            val_episodes_resolved = list(cfg.val_dataset.episodes)
+
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
@@ -387,6 +414,47 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+        if cfg.val_freq > 0 and not cfg.is_reward_model_training:
+            n_train = len(dataset.episodes) if dataset.episodes is not None else dataset.num_episodes
+            if val_episodes_resolved is not None:
+                logging.info(
+                    f"Offline val enabled: train_episodes={n_train}, val_episodes={len(val_episodes_resolved)}"
+                )
+            else:
+                logging.info(
+                    f"Offline val enabled: train_episodes={n_train}, val_episodes=<all from val_dataset>"
+                )
+
+    val_dataloader = None
+    if cfg.val_freq > 0 and not cfg.is_reward_model_training and is_main_process:
+        val_batch_size = cfg.val_batch_size if cfg.val_batch_size > 0 else cfg.batch_size
+        val_dataset = make_val_dataset(cfg, val_episodes=val_episodes_resolved)
+        if val_episodes_resolved is None and is_main_process:
+            n_val = len(val_dataset.episodes) if val_dataset.episodes is not None else val_dataset.num_episodes
+            logging.info(f"Offline val dataset loaded: val_episodes={n_val}")
+        if hasattr(active_cfg, "drop_n_last_frames"):
+            val_sampler = EpisodeAwareSampler(
+                val_dataset.meta.episodes["dataset_from_index"],
+                val_dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=val_dataset.episodes,
+                drop_n_last_frames=active_cfg.drop_n_last_frames,
+                shuffle=False,
+            )
+        else:
+            val_sampler = None
+        val_collate_fn = lerobot_collate_fn if val_dataset.meta.has_language_columns else None
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=val_batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            collate_fn=val_collate_fn,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
 
     # create dataloader for offline training
     if hasattr(active_cfg, "drop_n_last_frames"):
@@ -489,6 +557,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0
 
         if is_log_step:
             logging.info(train_tracker)
@@ -521,6 +590,24 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
+            accelerator.wait_for_everyone()
+
+        if is_val_step and val_dataloader is not None:
+            if is_main_process:
+                val_metrics = compute_offline_val_loss(
+                    policy=policy,
+                    val_dataloader=val_dataloader,
+                    preprocessor=preprocessor,
+                    accelerator=accelerator,
+                    camera_keys=dataset.meta.camera_keys,
+                )
+                metrics_str = " ".join(
+                    f"{k}:{v:.3f}" if isinstance(v, float) and k != "val_batches" else f"{k}:{v}"
+                    for k, v in val_metrics.items()
+                )
+                logging.info("Offline val step:%s %s", step, metrics_str)
+                if wandb_logger:
+                    wandb_logger.log_dict(val_metrics, step, mode="val")
             accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:

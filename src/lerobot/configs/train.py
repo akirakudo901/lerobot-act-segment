@@ -11,9 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 import builtins
 import datetime as dt
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -101,6 +106,14 @@ class TrainPipelineConfig(HubMixin):
     persistent_workers: bool = True
     steps: int = 100_000
     eval_freq: int = 20_000
+    # Run offline supervised validation every `val_freq` steps; `0` disables.
+    val_freq: int = 0
+    # Auto holdout fraction from the train episode pool (mutually exclusive with `val_dataset`).
+    val_split_fraction: float | None = None
+    # Explicit held-out dataset; episodes must not overlap train when repo_id+root match.
+    val_dataset: DatasetConfig | None = None
+    # Validation batch size; `0` reuses `batch_size`.
+    val_batch_size: int = 0
     log_freq: int = 200
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
@@ -204,6 +217,61 @@ class TrainPipelineConfig(HubMixin):
 
         if hasattr(active_cfg, "push_to_hub") and active_cfg.push_to_hub and not active_cfg.repo_id:
             raise ValueError("'repo_id' argument missing. Please specify it to push the model to the hub.")
+
+        self._validate_offline_val_config()
+
+    def _validate_offline_val_config(self) -> None:
+        from lerobot.common.offline_eval_utils import (
+            assert_no_episode_overlap,
+            resolve_episode_pool,
+        )
+        from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+
+        if self.val_freq <= 0:
+            return
+
+        has_fraction = self.val_split_fraction is not None
+        has_val_dataset = self.val_dataset is not None
+        if has_fraction == has_val_dataset:
+            raise ValueError(
+                "When val_freq > 0, specify exactly one of val_split_fraction or val_dataset."
+            )
+
+        if has_fraction:
+            if not 0 < self.val_split_fraction < 1:
+                raise ValueError(
+                    f"val_split_fraction must be in (0, 1), got {self.val_split_fraction}."
+                )
+            return
+
+        assert self.val_dataset is not None
+        if self.val_dataset.image_transforms.enable:
+            logging.warning(
+                "val_dataset.image_transforms.enable is True; disabling augmentations for offline val."
+            )
+            self.val_dataset.image_transforms.enable = False
+
+        same_dataset = (
+            self.val_dataset.repo_id == self.dataset.repo_id
+            and self.val_dataset.root == self.dataset.root
+        )
+        if same_dataset and self.val_dataset.episodes is None:
+            raise ValueError(
+                "When val_dataset shares repo_id+root with train, val_dataset.episodes must be "
+                "set explicitly. Use val_split_fraction for an automatic holdout, or list the "
+                "held-out episode indices in val_dataset.episodes."
+            )
+        if not same_dataset:
+            return
+
+        ds_meta = LeRobotDatasetMetadata(
+            self.dataset.repo_id,
+            root=self.dataset.root,
+            revision=self.dataset.revision,
+        )
+        train_episodes = resolve_episode_pool(self.dataset.episodes, ds_meta.total_episodes)
+        val_episodes = resolve_episode_pool(self.val_dataset.episodes, ds_meta.total_episodes)
+        assert_no_episode_overlap(train_episodes, val_episodes)
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

@@ -40,9 +40,9 @@ class ACTSegment(ACT):
         self.label_head = nn.Linear(config.dim_model, config.num_label_classes)
 
     def forward(
-        self, batch: dict[str, Tensor]
+        self, batch: dict[str, Tensor], sample_encoded_dist: bool = False
     ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        actions, vae_params, decoder_out = self._forward_from_batch(batch)
+        actions, vae_params, decoder_out = self._forward_from_batch(batch, sample_encoded_dist)
         labels_logits = self.label_head(decoder_out)
         return actions, labels_logits, vae_params
 
@@ -97,9 +97,14 @@ class ACTSegmentPolicy(ACTPolicy):
         _actions, labels_logits, _vae_params = self.model(batch)
         return labels_logits.argmax(dim=-1)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        sample_encoded_dist: bool | None = None,
+    ) -> tuple[Tensor, dict]:
         batch = self._prepare_batch(batch)
-        actions_hat, labels_logits, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
+        actions_hat, labels_logits, (mu_hat, log_sigma_x2_hat) = self.model(batch, sample_encoded_dist)
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         action_valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
