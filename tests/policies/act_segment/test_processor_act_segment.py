@@ -17,6 +17,8 @@
 # IMPLEMENTED BY akirakudo901 for the hybrid-motion-planner project
 # see: https://github.com/akirakudo901/lerobot-act-segment
 
+import tempfile
+
 import numpy as np
 import pytest
 import torch
@@ -27,6 +29,7 @@ from lerobot.policies.act_segment.processor_act_segment import (
     EfficientLiberoStateReorderStep,
     make_act_segment_pre_post_processors,
 )
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor.env_processor import LiberoProcessorStep
 
 
@@ -69,6 +72,22 @@ def test_act_segment_preprocessor_skips_reorder_by_default():
     config = ACTSegmentConfig()
     preprocessor, _ = make_act_segment_pre_post_processors(config)
     assert not any(isinstance(step, EfficientLiberoStateReorderStep) for step in preprocessor.steps)
+
+
+def test_act_segment_preprocessor_loads_efficient_libero_step_from_checkpoint():
+    """Saved efficient_libero reorder step resolves when loading from pretrained."""
+    config = ACTSegmentConfig(observation_state_layout="efficient_libero")
+    preprocessor, postprocessor = make_act_segment_pre_post_processors(config)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        preprocessor.save_pretrained(tmpdir)
+        postprocessor.save_pretrained(tmpdir)
+        loaded_preprocessor, _ = make_pre_post_processors(
+            policy_cfg=config,
+            pretrained_path=tmpdir,
+        )
+
+    assert isinstance(loaded_preprocessor.steps[0], EfficientLiberoStateReorderStep)
 
 
 def test_libero_env_output_reordered_to_efficient_layout():

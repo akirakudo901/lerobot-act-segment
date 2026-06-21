@@ -304,6 +304,14 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        act_segment_prepend_state_layout_step = None
+        if isinstance(policy_cfg, ACTSegmentConfig):
+            # Saved act_segment preprocessors may reference custom registry steps
+            # (e.g. efficient_libero_state_reorder); import before from_pretrained.
+            from .act_segment.processor_act_segment import (
+                prepend_act_segment_state_layout_step as act_segment_prepend_state_layout_step,
+            )
+
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(
@@ -323,10 +331,8 @@ def make_pre_post_processors(
             to_output=transition_to_policy_action,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
-        if isinstance(policy_cfg, ACTSegmentConfig):
-            from .act_segment.processor_act_segment import prepend_act_segment_state_layout_step
-
-            preprocessor = prepend_act_segment_state_layout_step(preprocessor, policy_cfg)
+        if act_segment_prepend_state_layout_step is not None:
+            preprocessor = act_segment_prepend_state_layout_step(preprocessor, policy_cfg)
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type
