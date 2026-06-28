@@ -45,9 +45,9 @@ class ACTSegmentConfig(ACTConfig):
     hybrid_refill_mode: str = "full_chunk"
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
-    # Default ``None``: no reordering. Set explicitly when eval env layout differs from training, e.g.
-    # ``efficient_libero`` for policies trained on efficient LIBERO exports
-    # (gripper + ee_pos + ee_ori instead of LIBERO's ee_pos + axis-angle + gripper).
+    # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
+    # ``lerobot`` for datasets with ee_pos + ee_ori + gripper (no reorder step),
+    # ``efficient_libero`` for legacy efficient exports (gripper + ee_pos + ee_ori).
     observation_state_layout: str | None = None
 
     @property

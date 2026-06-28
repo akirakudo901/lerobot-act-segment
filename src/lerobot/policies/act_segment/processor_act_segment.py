@@ -36,7 +36,9 @@ from lerobot.utils.constants import OBS_STATE
 from ..act.processor_act import make_act_pre_post_processors
 from .configuration_act_segment import ACTSegmentConfig
 
+_LEROBOT_STATE_LAYOUT = "lerobot"
 _EFFICIENT_LIBERO_STATE_LAYOUT = "efficient_libero"
+_SUPPORTED_STATE_LAYOUTS = (None, _LEROBOT_STATE_LAYOUT, _EFFICIENT_LIBERO_STATE_LAYOUT)
 # Default LIBERO flat state: ee_pos(3), ee_axis_angle(3), gripper(2).
 # Efficient export / training order: gripper(2), ee_pos(3), ee_ori(3).
 _LIBERO_TO_EFFICIENT_STATE_INDICES = (6, 7, 0, 1, 2, 3, 4, 5)
@@ -77,13 +79,13 @@ class EfficientLiberoStateReorderStep(ObservationProcessorStep):
 
 
 def _state_layout_step(layout: str | None) -> ObservationProcessorStep | None:
-    if layout is None:
+    if layout in (None, _LEROBOT_STATE_LAYOUT):
         return None
     if layout == _EFFICIENT_LIBERO_STATE_LAYOUT:
         return EfficientLiberoStateReorderStep()
+    supported = ", ".join(repr(value) for value in _SUPPORTED_STATE_LAYOUTS)
     raise ValueError(
-        f"Unsupported observation_state_layout={layout!r} for act_segment. "
-        f"Supported: {None!r}, {_EFFICIENT_LIBERO_STATE_LAYOUT!r}."
+        f"Unsupported observation_state_layout={layout!r} for act_segment. Supported: {supported}."
     )
 
 
