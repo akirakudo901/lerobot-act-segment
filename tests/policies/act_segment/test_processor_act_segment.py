@@ -74,6 +74,19 @@ def test_act_segment_preprocessor_skips_reorder_by_default():
     assert not any(isinstance(step, EfficientLiberoStateReorderStep) for step in preprocessor.steps)
 
 
+def test_act_segment_preprocessor_skips_reorder_for_lerobot_layout():
+    """Lerobot datasets already use ee_pos + ee_ori + gripper; no reorder step is needed."""
+    config = ACTSegmentConfig(observation_state_layout="lerobot")
+    preprocessor, _ = make_act_segment_pre_post_processors(config)
+    assert not any(isinstance(step, EfficientLiberoStateReorderStep) for step in preprocessor.steps)
+
+
+def test_act_segment_preprocessor_rejects_unknown_state_layout():
+    config = ACTSegmentConfig(observation_state_layout="unknown_layout")
+    with pytest.raises(ValueError, match="Unsupported observation_state_layout='unknown_layout'"):
+        make_act_segment_pre_post_processors(config)
+
+
 def test_act_segment_preprocessor_loads_efficient_libero_step_from_checkpoint():
     """Saved efficient_libero reorder step resolves when loading from pretrained."""
     config = ACTSegmentConfig(observation_state_layout="efficient_libero")
