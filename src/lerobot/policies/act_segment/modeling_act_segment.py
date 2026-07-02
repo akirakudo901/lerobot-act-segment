@@ -54,6 +54,27 @@ class IkPending:
     mask: list[bool]
 
 
+@dataclass(frozen=True)
+class HybridStepTelemetry:
+    """Per-env hybrid routing metadata from the last ``select_action`` call."""
+
+    frame_label: int
+    frame_label_str: str
+    output_frame_index: int
+    action_source: str
+    is_new_chunk: bool
+    chunk_anchor_step: int
+
+
+@dataclass(frozen=True)
+class HybridChunkTelemetry:
+    """Completed policy chunk metadata for live-eval visualization."""
+
+    row: int
+    anchor_step: int
+    orchestrator_output: Any
+
+
 class ACTSegment(ACT):
     """ACT decoder extended with a linear label head on decoder tokens."""
 
@@ -122,6 +143,14 @@ class ACTSegmentPolicy(ACTPolicy):
         self._targets_by_frame: list[dict[int, PlanningTarget]] = []
         self._executed_target_ids: list[set[int]] = []
         self._ik_pending: IkPending | None = None
+        self._chunk_anchor_steps: list[int] = []
+        self._rollout_step: int = 0
+        self._last_step_telemetry: list[HybridStepTelemetry | None] = []
+        self._completed_chunks: list[HybridChunkTelemetry] = []
+
+    def set_rollout_step(self, step: int) -> None:
+        """Set the current episode step index (used for chunk anchor bookkeeping)."""
+        self._rollout_step = int(step)
 
     def consume_ik_pending(self) -> IkPending | None:
         """Return and clear IK targets from the last ``select_action`` call."""
@@ -130,6 +159,57 @@ class ACTSegmentPolicy(ACTPolicy):
         if pending is None or not any(pending.mask):
             return None
         return pending
+
+    def consume_hybrid_step_telemetry(self) -> list[HybridStepTelemetry | None]:
+        """Return and clear per-row telemetry from the last ``select_action`` call."""
+        telemetry = self._last_step_telemetry
+        self._last_step_telemetry = []
+        return telemetry
+
+    def pop_completed_chunks(self) -> list[HybridChunkTelemetry]:
+        """Return and clear policy chunks completed since the last pop."""
+        completed = self._completed_chunks
+        self._completed_chunks = []
+        return completed
+
+    def finalize_rollout_chunks(self) -> list[HybridChunkTelemetry]:
+        """Emit any in-progress chunks at episode end (call before ``reset``)."""
+        if self._chunk_actions is None:
+            return []
+        from hybrid_eval.orchestrator import HybridPolicyOutput
+
+        batch_size = self._select_action_batchsize
+        finalized: list[HybridChunkTelemetry] = []
+        for row in range(batch_size):
+            if self._chunk_t[row] <= 0:
+                continue
+            finalized.append(
+                HybridChunkTelemetry(
+                    row=row,
+                    anchor_step=int(self._chunk_anchor_steps[row]),
+                    orchestrator_output=self._snapshot_chunk_output(row),
+                )
+            )
+        self._completed_chunks.extend(finalized)
+        return self.pop_completed_chunks()
+
+    def _snapshot_chunk_output(self, row: int) -> Any:
+        from dataset.core.frame_labels import FrameLabelEnum
+        from hybrid_eval.orchestrator import HybridPolicyOutput
+
+        assert self._chunk_actions is not None
+        assert self._chunk_labels is not None
+        horizon = int(self._chunk_horizons[row])
+        actions_np = self._chunk_actions[row, :horizon].detach().cpu().numpy()
+        labels_np = self._chunk_labels[row, :horizon].detach().cpu().numpy()
+        labels_str = tuple(FrameLabelEnum.to_str(int(v)) for v in labels_np)
+        targets = tuple(self._targets_by_frame[row].values())
+        return HybridPolicyOutput(
+            actions=actions_np,
+            frame_labels=labels_np,
+            frame_labels_str=labels_str,
+            planning_targets=targets,
+        )
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.image_features:
@@ -244,9 +324,18 @@ class ACTSegmentPolicy(ACTPolicy):
             self._executed_target_ids = [set() for _ in range(batch_size)]
             self._chunk_t = [0] * batch_size
             self._chunk_horizons = [self.config.n_action_steps] * batch_size
+            self._chunk_anchor_steps = [self._rollout_step] * batch_size
 
         # Now update only requested rows with fresh chunk
         for i, row in enumerate(rows):
+            if self._chunk_t[row] > 0:
+                self._completed_chunks.append(
+                    HybridChunkTelemetry(
+                        row=row,
+                        anchor_step=int(self._chunk_anchor_steps[row]),
+                        orchestrator_output=self._snapshot_chunk_output(row),
+                    )
+                )
             horizon = (
                 self._effective_chunk_horizon(labels[i])
                 if self.config.hybrid_refill_mode == "until_first_mp"
@@ -256,6 +345,7 @@ class ACTSegmentPolicy(ACTPolicy):
             self._chunk_labels[row] = labels[i]
             self._chunk_horizons[row] = horizon
             self._chunk_t[row] = 0
+            self._chunk_anchor_steps[row] = self._rollout_step
 
             # Connector copies policy-output actions into PlanningTarget; unnormalization
             # must happen in the eval rollout alongside the per-step select_action output.
@@ -293,11 +383,13 @@ class ACTSegmentPolicy(ACTPolicy):
         actions_out = torch.empty(batch_size, action_dim, device=device, dtype=dtype)
         ik_targets: list[Any | None] = [None] * batch_size
         ik_mask = [False] * batch_size
+        step_telemetry: list[HybridStepTelemetry | None] = [None] * batch_size
 
         for row in range(batch_size):
             chunk_t = self._chunk_t[row]
             target = self._targets_by_frame[row].get(chunk_t)
             label = int(self._chunk_labels[row, chunk_t].item())
+            action_source = "none"
 
             if target is not None and id(target) not in self._executed_target_ids[row]:
                 if self.config.mp_executor_type == "ik_pose_setter":
@@ -306,6 +398,7 @@ class ACTSegmentPolicy(ACTPolicy):
                     actions_out[row] = dummy
                     ik_targets[row] = target
                     ik_mask[row] = True
+                    action_source = "mp"
                     self._executed_target_ids[row].add(id(target))
                 else:
                     raise NotImplementedError(
@@ -313,12 +406,22 @@ class ACTSegmentPolicy(ACTPolicy):
                     )
             elif FrameLabelEnum.is_l_frame_label(label) or FrameLabelEnum.is_mp_frame_label(label):
                 actions_out[row] = self._chunk_actions[row, chunk_t]
+                action_source = "policy"
             else:
                 raise ValueError(f"unknown frame label {label!r} at chunk index {chunk_t}")
 
+            step_telemetry[row] = HybridStepTelemetry(
+                frame_label=label,
+                frame_label_str=FrameLabelEnum.to_str(label),
+                output_frame_index=chunk_t,
+                action_source=action_source,
+                is_new_chunk=chunk_t == 0,
+                chunk_anchor_step=int(self._chunk_anchor_steps[row]),
+            )
             self._chunk_t[row] += 1
 
         self._ik_pending = IkPending(targets=ik_targets, mask=ik_mask)
+        self._last_step_telemetry = step_telemetry
         return actions_out
 
     def forward(
