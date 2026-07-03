@@ -48,7 +48,7 @@ from lerobot.utils.utils import init_logging
 
 
 @parser.wrap()
-def eval_viz_main(cfg: EvalPipelineConfig):
+def eval_hybrid_viz_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
 
     device = get_safe_torch_device(cfg.policy.device, log=True)
@@ -117,7 +117,7 @@ def eval_viz_main(cfg: EvalPipelineConfig):
 def main():
     register_third_party_plugins()
     init_logging()
-    eval_viz_main()
+    eval_hybrid_viz_main()
 
 
 if __name__ == "__main__":
