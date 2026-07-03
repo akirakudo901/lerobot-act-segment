@@ -31,6 +31,9 @@ are gated behind optional extras::
     pip install 'lerobot[all]'           # everything
 """
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 from lerobot.__version__ import __version__
 
 # Maps optional extras to the CLI entry-points they unlock.
@@ -45,7 +48,7 @@ available_extras: dict[str, list[str]] = {
         "lerobot-setup-motors",
     ],
     "core_scripts": ["lerobot-record", "lerobot-replay", "lerobot-teleoperate"],
-    "evaluation": ["lerobot-eval"],
+    "evaluation": ["lerobot-eval", "lerobot-eval-hybrid-viz"],
 }
 
 __all__ = ["__version__", "available_extras"]

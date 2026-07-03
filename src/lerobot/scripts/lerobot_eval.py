@@ -139,6 +139,8 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    # Hybrid-motion-planner extension (akirakudo901): utility for recording "hybrid" execution result for vis
+    live_recorder: Any | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -188,6 +190,8 @@ def rollout(
     step = 0
     # Keep track of which environments are done.
     done = np.array([False] * env.num_envs)
+    # Hybrid-motion-planner extension (akirakudo901): track which environment is done recording
+    env_done_recorded = np.array([False] * env.num_envs)
     max_steps = env.call("_max_episode_steps")[0]
     progbar = trange(
         max_steps,
@@ -217,6 +221,12 @@ def rollout(
         env_preprocessed_obs = observation
 
         observation = preprocessor(observation)
+        
+        # Hybrid-motion-planner extension (akirakudo901)
+        set_rollout_step = getattr(policy, "set_rollout_step", None)
+        if live_recorder is not None and callable(set_rollout_step):
+            set_rollout_step(step)
+        
         with torch.inference_mode():
             action = policy.select_action(observation)
         
@@ -240,6 +250,39 @@ def rollout(
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+
+        # Hybrid-motion-planner extension (akirakudo901): record hybrid step info
+        if live_recorder is not None:
+            pop_completed_chunks = getattr(policy, "pop_completed_chunks", None)
+            if callable(pop_completed_chunks):
+                for chunk in pop_completed_chunks():
+                    live_recorder.register_completed_chunk(
+                        chunk.row,
+                        anchor_step=chunk.anchor_step,
+                        orchestrator_output=chunk.orchestrator_output,
+                    )
+            consume_telemetry = getattr(policy, "consume_hybrid_step_telemetry", None)
+            if callable(consume_telemetry):
+                snapshot_chunk = getattr(policy, "_snapshot_chunk_output", None)
+                for env_ix, telemetry in enumerate(consume_telemetry()):
+                    if telemetry is None or env_done_recorded[env_ix]:
+                        continue
+                    chunk_output = None
+                    if telemetry.is_new_chunk and callable(snapshot_chunk):
+                        chunk_output = snapshot_chunk(env_ix)
+                    live_recorder.record_pre_step(
+                        env_ix,
+                        episode_step=step,
+                        observation=env_preprocessed_obs,
+                        frame_label=telemetry.frame_label,
+                        frame_label_str=telemetry.frame_label_str,
+                        output_frame_index=telemetry.output_frame_index,
+                        action_source=telemetry.action_source,
+                        applied_action=action_numpy[env_ix],
+                        is_new_chunk=telemetry.is_new_chunk,
+                        chunk_anchor_step=telemetry.chunk_anchor_step,
+                        chunk_output=chunk_output,
+                    )
 
         # Apply the next action.
         observation, reward, terminated, truncated, info = env.step(action_numpy)
@@ -276,6 +319,8 @@ def rollout(
         done = terminated | truncated | done
         if step + 1 == max_steps:
             done = np.ones_like(done, dtype=bool)
+        # Hybrid-motion-planner extension (akirakudo901): update which environment are done
+        env_done_recorded = env_done_recorded | done
 
         all_actions.append(torch.from_numpy(action_numpy))
         all_rewards.append(torch.from_numpy(reward))
@@ -288,6 +333,17 @@ def rollout(
         )
         progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
         progbar.update()
+
+    # Hybrid-motion-planner extension (akirakudo901): finalize rollout result
+    if live_recorder is not None:
+        finalize_rollout_chunks = getattr(policy, "finalize_rollout_chunks", None)
+        if callable(finalize_rollout_chunks):
+            for chunk in finalize_rollout_chunks():
+                live_recorder.register_completed_chunk(
+                    chunk.row,
+                    anchor_step=chunk.anchor_step,
+                    orchestrator_output=chunk.orchestrator_output,
+                )
 
     # Track the final observation.
     if return_observations:
@@ -325,6 +381,8 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    # Hybrid-motion-planner extension (akirakudo901): directory to store hybrid videos to (overwrites videos_dir when specified)
+    hybrid_videos_dir: Path | None = None,
 ) -> dict:
     """
     Args:
@@ -340,8 +398,14 @@ def eval_policy(
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
-    if max_episodes_rendered > 0 and not videos_dir:
-        raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
+    # Hybrid-motion-planner extension (akirakudo901)
+    if max_episodes_rendered > 0 and not videos_dir and hybrid_videos_dir is None:
+        raise ValueError("If max_episodes_rendered > 0, videos_dir or hybrid_videos_dir must be provided.")
+    # Hybrid-motion-planner extension (akirakudo901)
+    use_hybrid_videos = hybrid_videos_dir is not None and max_episodes_rendered > 0
+    if use_hybrid_videos:
+        from hybrid_eval.eval.live_rollout_recording import LiveRolloutRecorder
+        from hybrid_eval.visualize.hybrid_rollout_render import render_segment_hybrid_rollout_video
 
     if not isinstance(policy, PreTrainedPolicy):
         exc = ValueError(
@@ -394,8 +458,12 @@ def eval_policy(
     for batch_ix in progbar:
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
         # step.
-        if max_episodes_rendered > 0:
+        # Hybrid-motion-planner extension (akirakudo901)
+        if max_episodes_rendered > 0 and not use_hybrid_videos:
             ep_frames: list[np.ndarray] = []
+
+        # Hybrid-motion-planner extension (akirakudo901)
+        live_recorder = LiveRolloutRecorder(env.num_envs) if use_hybrid_videos else None
 
         if start_seed is None:
             seeds = None
@@ -412,7 +480,8 @@ def eval_policy(
             postprocessor=postprocessor,
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
-            render_callback=render_frame if max_episodes_rendered > 0 else None,
+            render_callback=render_frame if max_episodes_rendered > 0 and not use_hybrid_videos else None,
+            live_recorder=live_recorder,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -455,7 +524,33 @@ def eval_policy(
                 episode_data = {k: torch.cat([episode_data[k], this_episode_data[k]]) for k in episode_data}
 
         # Maybe render video for visualization.
-        if max_episodes_rendered > 0 and len(ep_frames) > 0:
+        # Hybrid-motion-planner extension (akirakudo901)
+        if use_hybrid_videos and live_recorder is not None:
+            hybrid_videos_dir.mkdir(parents=True, exist_ok=True)
+            fps = int(env.unwrapped.metadata.get("render_fps", 10))
+            n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+            for env_ix, done_index in enumerate(done_indices.flatten().tolist()[:n_to_render_now]):
+                if n_episodes_rendered >= max_episodes_rendered:
+                    break
+                segment_result = live_recorder.finalize_episode(
+                    env_ix,
+                    max_step=int(done_index) + 1,
+                )
+                video_path = hybrid_videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
+                render_segment_hybrid_rollout_video(
+                    segment_result,
+                    video_path,
+                    video_fps=fps,
+                    show_ground_truth=False,
+                    show_gt_segment_span=False,
+                    show_predicted_span_overlays=False,
+                    x_label="episode step",
+                )
+                video_paths.append(str(video_path))
+                live_recorder.reset_episode(env_ix)
+                n_episodes_rendered += 1
+        # Normal video rendering
+        elif max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
             for stacked_frames, done_index in zip(
                 batch_stacked_frames, done_indices.flatten().tolist(), strict=False
@@ -670,10 +765,10 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    # Hybrid-motion-planner extension (akirakudo901): directory for storing hybrid execution videos
+    hybrid_videos_dir: Path | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
-
-    task_videos_dir = videos_dir
 
     task_result = eval_policy(
         env=env,
@@ -684,9 +779,11 @@ def eval_one(
         postprocessor=postprocessor,
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
-        videos_dir=task_videos_dir,
+        videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        # Hybrid-motion-planner extension (akirakudo901)
+        hybrid_videos_dir=hybrid_videos_dir,
     )
 
     per_episode = task_result["per_episode"]
@@ -713,6 +810,8 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    # Hybrid-motion-planner extension (akirakudo901): directory for storing hybrid execution videos
+    hybrid_videos_dir: Path | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -723,6 +822,11 @@ def run_one(
     if videos_dir is not None:
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
+    # Hybrid-motion-planner extension (akirakudo901)
+    task_hybrid_videos_dir = None
+    if hybrid_videos_dir is not None:
+        task_hybrid_videos_dir = hybrid_videos_dir / f"{task_group}_{task_id}"
+        task_hybrid_videos_dir.mkdir(parents=True, exist_ok=True)
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
     metrics = eval_one(
@@ -737,6 +841,8 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        # Hybrid-motion-planner extension (akirakudo901)
+        hybrid_videos_dir=task_hybrid_videos_dir,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -755,6 +861,8 @@ def eval_policy_all(
     *,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
+    # Hybrid-motion-planner extension (akirakudo901)
+    hybrid_videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
@@ -811,6 +919,8 @@ def eval_policy_all(
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
+        # Hybrid-motion-planner extension (akirakudo901)
+        hybrid_videos_dir=hybrid_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
     )
