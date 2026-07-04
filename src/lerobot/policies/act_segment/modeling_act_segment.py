@@ -117,15 +117,15 @@ class ACTSegmentPolicy(ACTPolicy):
         self.reset()
 
     def _make_hybrid_connector(self) -> MpSegmentConnector:
-        from hybrid_eval.connectors import ConsecutiveMpConnector, SegmentEndpointsConnector
+        from hybrid_eval.connectors import MpLabeledFramesConnector, SegmentEndpointsConnector
 
         name = self.config.hybrid_connector
-        if name == "consecutive_mp":
-            return ConsecutiveMpConnector()
+        if name == "mp_labeled_frames":
+            return MpLabeledFramesConnector()
         if name == "segment_endpoints":
             return SegmentEndpointsConnector()
         raise ValueError(
-            f"Unknown hybrid_connector {name!r}; expected 'consecutive_mp' or 'segment_endpoints'"
+            f"Unknown hybrid_connector {name!r}; expected 'mp_labeled_frames' or 'segment_endpoints'"
         )
 
     def reset(self):

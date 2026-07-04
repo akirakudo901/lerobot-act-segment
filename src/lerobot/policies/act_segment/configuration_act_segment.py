@@ -38,7 +38,7 @@ class ACTSegmentConfig(ACTConfig):
     num_label_classes: int = 4
 
     use_hybrid_orchestrator: bool = False
-    hybrid_connector: str = "consecutive_mp"
+    hybrid_connector: str = "mp_labeled_frames"
     mp_executor_type: str = "ik_pose_setter"
     # ``full_chunk``: execute all ``n_action_steps`` before refill.
     # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
