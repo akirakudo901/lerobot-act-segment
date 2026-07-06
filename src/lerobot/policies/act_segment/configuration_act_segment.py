@@ -50,6 +50,10 @@ class ACTSegmentConfig(ACTConfig):
     # ``efficient_libero`` for legacy efficient exports (gripper + ee_pos + ee_ori).
     observation_state_layout: str | None = None
 
+    # MP-action rescaling registry for eval-time inverse transform on predicted MP rows.
+    mp_action_rescaling_registry_path: str | None = None
+    mp_action_rescaling_strategy: str | None = None
+
     @property
     def label_delta_indices(self) -> list[int]:
         return list(range(self.chunk_size))
