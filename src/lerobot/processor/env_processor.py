@@ -56,7 +56,10 @@ class LiberoProcessorStep(ObservationProcessorStep):
                 img = processed_obs[key]
 
                 # Flip both H and W
-                img = torch.flip(img, dims=[2, 3])
+                # TODO FIX (akirak12): Find a way to toggle this via some config setting, or align the dataset to flip
+                # UNCOMMENT THIS!
+                # img = torch.flip(img, dims=[2, 3])
+                # TODO FIX END
 
                 processed_obs[key] = img
         # Process robot_state into a flat state vector
