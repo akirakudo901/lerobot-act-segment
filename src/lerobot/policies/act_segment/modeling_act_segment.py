@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
@@ -38,7 +39,10 @@ from .configuration_act_segment import ACTSegmentConfig
 
 if TYPE_CHECKING:
     from hybrid_eval.connectors.planning_target import PlanningTarget
+    from hybrid_eval.eval.mp_action_rescaling_rollout import MpActionRescalingRolloutContext
     from hybrid_eval.protocols import MpSegmentConnector
+
+_UNSET_MP_RESCALING_CTX = object()
 
 
 @dataclass
@@ -114,6 +118,8 @@ class ACTSegmentPolicy(ACTPolicy):
         if config.use_hybrid_orchestrator:
             self._connector = self._make_hybrid_connector()
 
+        self._rollout_postprocessor: Any | None = None
+        self._mp_rescaling_ctx: MpActionRescalingRolloutContext | None = self._init_mp_rescaling_context()
         self.reset()
 
     def _make_hybrid_connector(self) -> MpSegmentConnector:
@@ -127,6 +133,13 @@ class ACTSegmentPolicy(ACTPolicy):
         raise ValueError(
             f"Unknown hybrid_connector {name!r}; expected 'mp_labeled_frames' or 'segment_endpoints'"
         )
+
+    def _init_mp_rescaling_context(self) -> MpActionRescalingRolloutContext | None:
+        """Resolve the MP inverse-rescaling registry tied to this policy's training dataset."""
+        from hybrid_eval.eval.mp_action_rescaling_rollout import resolve_mp_action_rescaling_context
+
+        pretrained_path = Path(self.config.pretrained_path) if self.config.pretrained_path else None
+        return resolve_mp_action_rescaling_context(self.config, pretrained_path=pretrained_path)
 
     def reset(self):
         """Clear ACT queues and hybrid orchestrator chunk state."""
@@ -147,19 +160,22 @@ class ACTSegmentPolicy(ACTPolicy):
         self._rollout_step: int = 0
         self._last_step_telemetry: list[HybridStepTelemetry | None] = []
         self._completed_chunks: list[HybridChunkTelemetry] = []
-        self._rollout_postprocessor: Any | None = None
-        self._mp_rescaling_ctx: Any | None = None
         self._last_step_ik_mask: list[bool] = []
 
     def set_rollout_action_processors(
         self,
         postprocessor: Any | None,
         *,
-        mp_rescaling_ctx: Any | None = None,
+        mp_rescaling_ctx: Any | None = _UNSET_MP_RESCALING_CTX,
     ) -> None:
-        """Attach eval-time action postprocessing used inside :meth:`select_action`."""
+        """Attach eval-time action postprocessing used inside :meth:`select_action`.
+
+        MP rescaling context is resolved once at policy construction from the training
+        dataset registry. Pass ``mp_rescaling_ctx`` only when overriding that default.
+        """
         self._rollout_postprocessor = postprocessor
-        self._mp_rescaling_ctx = mp_rescaling_ctx
+        if mp_rescaling_ctx is not _UNSET_MP_RESCALING_CTX:
+            self._mp_rescaling_ctx = mp_rescaling_ctx
 
     def _task_descriptions_for_batch(
         self,

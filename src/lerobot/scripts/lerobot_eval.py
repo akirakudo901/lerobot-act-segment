@@ -107,21 +107,15 @@ def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
 
 
 def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_cfg: Any, postprocessor) -> None:
-    """Wire eval postprocessor and MP rescaling into act_segment ``select_action``."""
+    """Wire eval postprocessor into act_segment ``select_action``."""
     from lerobot.policies.act_segment.configuration_act_segment import ACTSegmentConfig
 
     if not isinstance(policy_cfg, ACTSegmentConfig):
         return
 
-    from hybrid_eval.eval.mp_action_rescaling_rollout import resolve_mp_action_rescaling_context
-
-    mp_rescaling_ctx = resolve_mp_action_rescaling_context(
-        policy_cfg,
-        pretrained_path=policy_cfg.pretrained_path,
-    )
     set_processors = getattr(policy, "set_rollout_action_processors", None)
     if callable(set_processors):
-        set_processors(postprocessor, mp_rescaling_ctx=mp_rescaling_ctx)
+        set_processors(postprocessor)
 
 
 def _policy_handles_rollout_postprocess(policy: PreTrainedPolicy) -> bool:
