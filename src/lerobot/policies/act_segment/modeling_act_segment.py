@@ -38,8 +38,8 @@ from ..pretrained import PreTrainedPolicy
 from .configuration_act_segment import ACTSegmentConfig
 
 if TYPE_CHECKING:
+    from dataset.core.mp_action_rescaling import MpActionRescalingRolloutContext
     from hybrid_eval.connectors.planning_target import PlanningTarget
-    from hybrid_eval.eval.mp_action_rescaling_rollout import MpActionRescalingRolloutContext
     from hybrid_eval.protocols import MpSegmentConnector
 
 _UNSET_MP_RESCALING_CTX = object()
@@ -136,10 +136,14 @@ class ACTSegmentPolicy(ACTPolicy):
 
     def _init_mp_rescaling_context(self) -> MpActionRescalingRolloutContext | None:
         """Resolve the MP inverse-rescaling registry tied to this policy's training dataset."""
-        from hybrid_eval.eval.mp_action_rescaling_rollout import resolve_mp_action_rescaling_context
+        from dataset.core.mp_action_rescaling import resolve_mp_action_rescaling_context
 
         pretrained_path = Path(self.config.pretrained_path) if self.config.pretrained_path else None
-        return resolve_mp_action_rescaling_context(self.config, pretrained_path=pretrained_path)
+        return resolve_mp_action_rescaling_context(
+            registry_path=self.config.mp_action_rescaling_registry_path,
+            strategy_name=self.config.mp_action_rescaling_strategy,
+            pretrained_path=pretrained_path,
+        )
 
     def reset(self):
         """Clear ACT queues and hybrid orchestrator chunk state."""
