@@ -51,6 +51,8 @@ class ACTSegmentConfig(ACTConfig):
     observation_state_layout: str | None = None
 
     # MP-action rescaling registry for eval-time inverse transform on predicted MP rows.
+    # When unset, resolved automatically from {dataset_root}/meta/mp_action_rescaling.json
+    # using dataset metadata at policy construction or train_config.json beside pretrained_path.
     mp_action_rescaling_registry_path: str | None = None
     mp_action_rescaling_strategy: str | None = None
 

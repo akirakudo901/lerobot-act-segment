@@ -118,8 +118,12 @@ class ACTSegmentPolicy(ACTPolicy):
         if config.use_hybrid_orchestrator:
             self._connector = self._make_hybrid_connector()
 
+        dataset_meta = kwargs.get("dataset_meta")
+        dataset_root = getattr(dataset_meta, "root", None) if dataset_meta is not None else None
         self._rollout_postprocessor: Any | None = None
-        self._mp_rescaling_ctx: MpActionRescalingRolloutContext | None = self._init_mp_rescaling_context()
+        self._mp_rescaling_ctx: MpActionRescalingRolloutContext | None = self._init_mp_rescaling_context(
+            dataset_root=dataset_root,
+        )
         self.reset()
 
     def _make_hybrid_connector(self) -> MpSegmentConnector:
@@ -134,7 +138,11 @@ class ACTSegmentPolicy(ACTPolicy):
             f"Unknown hybrid_connector {name!r}; expected 'mp_labeled_frames' or 'segment_endpoints'"
         )
 
-    def _init_mp_rescaling_context(self) -> MpActionRescalingRolloutContext | None:
+    def _init_mp_rescaling_context(
+        self,
+        *,
+        dataset_root: Path | str | None = None,
+    ) -> MpActionRescalingRolloutContext | None:
         """Resolve the MP inverse-rescaling registry tied to this policy's training dataset."""
         from dataset.core.mp_action_rescaling import resolve_mp_action_rescaling_context
 
@@ -142,6 +150,7 @@ class ACTSegmentPolicy(ACTPolicy):
         return resolve_mp_action_rescaling_context(
             registry_path=self.config.mp_action_rescaling_registry_path,
             strategy_name=self.config.mp_action_rescaling_strategy,
+            dataset_root=dataset_root,
             pretrained_path=pretrained_path,
         )
 
