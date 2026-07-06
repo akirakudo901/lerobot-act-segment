@@ -61,7 +61,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from pprint import pformat
@@ -106,27 +106,28 @@ def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
         return None
 
 
-def _postprocess_ik_pending_targets(
-    ik_pending: Any,
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
-) -> Any:
-    """Unnormalize ``PlanningTarget.action`` rows stashed for MP IK execution."""
-    from hybrid_eval.connectors.planning_target import PlanningTarget
+def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_cfg: Any, postprocessor) -> None:
+    """Wire eval postprocessor and MP rescaling into act_segment ``select_action``."""
+    from lerobot.policies.act_segment.configuration_act_segment import ACTSegmentConfig
 
-    postprocessed_targets: list[PlanningTarget | None] = []
-    for target in ik_pending.targets:
-        if target is None:
-            postprocessed_targets.append(None)
-            continue
-        action_tensor = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
-        action_tensor = postprocessor(action_tensor)
-        action_np = (
-            action_tensor.squeeze(0).detach().cpu().numpy().astype(np.float64, copy=False)
-        )
-        postprocessed_targets.append(replace(target, action=action_np))
+    if not isinstance(policy_cfg, ACTSegmentConfig):
+        return
 
-    ik_pending.targets = postprocessed_targets
-    return ik_pending
+    from hybrid_eval.eval.mp_action_rescaling_rollout import resolve_mp_action_rescaling_context
+
+    mp_rescaling_ctx = resolve_mp_action_rescaling_context(
+        policy_cfg,
+        pretrained_path=policy_cfg.pretrained_path,
+    )
+    set_processors = getattr(policy, "set_rollout_action_processors", None)
+    if callable(set_processors):
+        set_processors(postprocessor, mp_rescaling_ctx=mp_rescaling_ctx)
+
+
+def _policy_handles_rollout_postprocess(policy: PreTrainedPolicy) -> bool:
+    return getattr(policy, "_rollout_postprocessor", None) is not None or getattr(
+        policy, "_mp_rescaling_ctx", None
+    ) is not None
 
 
 def rollout(
@@ -229,7 +230,10 @@ def rollout(
         
         with torch.inference_mode():
             action = policy.select_action(observation)
-        
+
+        if not _policy_handles_rollout_postprocess(policy):
+            action = postprocessor(action)
+
         # Hybrid-motion-planner extension (akirakudo901): execute inverse kinematics "jump" for applicable environments
         consume_ik = getattr(policy, "consume_ik_pending", None)
         ik_pending = consume_ik() if callable(consume_ik) else None
@@ -237,11 +241,6 @@ def rollout(
         ik_obs_hook = _ik_obs_hook_class(env) if ik_pending is not None else None
         if ik_pending is not None and ik_obs_hook is not None:
             pre_step_poses = ik_obs_hook.ee_poses_from_observation(env_preprocessed_obs, ik_pending.mask)
-
-        # Policy outputs are in normalized space; unnormalize before env control and IK.
-        action = postprocessor(action)
-        if ik_pending is not None:
-            ik_pending = _postprocess_ik_pending_targets(ik_pending, postprocessor)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
@@ -709,6 +708,8 @@ def eval_main(cfg: EvalPipelineConfig):
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
+    # Hybrid-motion-planner extension (akirakudo901): set up post processors for segment policies
+    _configure_act_segment_rollout_processors(policy, cfg.policy, postprocessor)
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(

@@ -38,7 +38,7 @@ class ACTSegmentConfig(ACTConfig):
     num_label_classes: int = 4
 
     use_hybrid_orchestrator: bool = False
-    hybrid_connector: str = "consecutive_mp"
+    hybrid_connector: str = "mp_labeled_frames"
     mp_executor_type: str = "ik_pose_setter"
     # ``full_chunk``: execute all ``n_action_steps`` before refill.
     # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
@@ -49,6 +49,10 @@ class ACTSegmentConfig(ACTConfig):
     # ``lerobot`` for datasets with ee_pos + ee_ori + gripper (no reorder step),
     # ``efficient_libero`` for legacy efficient exports (gripper + ee_pos + ee_ori).
     observation_state_layout: str | None = None
+
+    # MP-action rescaling registry for eval-time inverse transform on predicted MP rows.
+    mp_action_rescaling_registry_path: str | None = None
+    mp_action_rescaling_strategy: str | None = None
 
     @property
     def label_delta_indices(self) -> list[int]:

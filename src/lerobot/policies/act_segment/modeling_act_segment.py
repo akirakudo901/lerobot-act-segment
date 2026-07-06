@@ -45,9 +45,9 @@ if TYPE_CHECKING:
 class IkPending:
     """Batched IK targets stashed during ``select_action`` for the rollout hook.
 
-    Each ``PlanningTarget.action`` is in policy output space (normalized). The eval
-    rollout must run the policy postprocessor on both the returned step action and
-    these stored actions before ``env.step`` / ``IkPoseSetterMpExecutor`` execution.
+    Each ``PlanningTarget.action`` is in environment-ready space when
+    :meth:`ACTSegmentPolicy.set_rollout_action_processors` has been configured
+    (unnormalized and MP-inverse-rescaled when applicable).
     """
 
     targets: list[PlanningTarget | None]
@@ -117,15 +117,15 @@ class ACTSegmentPolicy(ACTPolicy):
         self.reset()
 
     def _make_hybrid_connector(self) -> MpSegmentConnector:
-        from hybrid_eval.connectors import ConsecutiveMpConnector, SegmentEndpointsConnector
+        from hybrid_eval.connectors import MpLabeledFramesConnector, SegmentEndpointsConnector
 
         name = self.config.hybrid_connector
-        if name == "consecutive_mp":
-            return ConsecutiveMpConnector()
+        if name == "mp_labeled_frames":
+            return MpLabeledFramesConnector()
         if name == "segment_endpoints":
             return SegmentEndpointsConnector()
         raise ValueError(
-            f"Unknown hybrid_connector {name!r}; expected 'consecutive_mp' or 'segment_endpoints'"
+            f"Unknown hybrid_connector {name!r}; expected 'mp_labeled_frames' or 'segment_endpoints'"
         )
 
     def reset(self):
@@ -147,6 +147,145 @@ class ACTSegmentPolicy(ACTPolicy):
         self._rollout_step: int = 0
         self._last_step_telemetry: list[HybridStepTelemetry | None] = []
         self._completed_chunks: list[HybridChunkTelemetry] = []
+        self._rollout_postprocessor: Any | None = None
+        self._mp_rescaling_ctx: Any | None = None
+        self._last_step_ik_mask: list[bool] = []
+
+    def set_rollout_action_processors(
+        self,
+        postprocessor: Any | None,
+        *,
+        mp_rescaling_ctx: Any | None = None,
+    ) -> None:
+        """Attach eval-time action postprocessing used inside :meth:`select_action`."""
+        self._rollout_postprocessor = postprocessor
+        self._mp_rescaling_ctx = mp_rescaling_ctx
+
+    def _task_descriptions_for_batch(
+        self,
+        batch: dict[str, Tensor],
+        batch_size: int,
+    ) -> list[str]:
+        task = batch.get("task")
+        if task is None:
+            return [""] * batch_size
+        if isinstance(task, (list, tuple)):
+            tasks = [str(t) for t in task]
+            if len(tasks) < batch_size:
+                tasks.extend([""] * (batch_size - len(tasks)))
+            return tasks[:batch_size]
+        return [str(task)] * batch_size
+
+    def _frame_labels_for_batch(self, batch_size: int) -> list[int | None]:
+        labels: list[int | None] = [
+            int(t.frame_label) if t is not None else None for t in self._last_step_telemetry
+        ]
+        if len(labels) < batch_size:
+            labels.extend([None] * (batch_size - len(labels)))
+        return labels[:batch_size]
+
+    def _finalize_rollout_action_tensor(
+        self,
+        action: Tensor,
+        *,
+        task_descriptions: Sequence[str],
+        frame_labels: Sequence[int | None],
+    ) -> Tensor:
+        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
+            return action
+
+        finalized = action
+        if self._rollout_postprocessor is not None:
+            finalized = self._rollout_postprocessor(finalized)
+
+        if self._mp_rescaling_ctx is not None:
+            from hybrid_eval.eval.mp_action_rescaling_rollout import (
+                apply_mp_action_rescaling_to_actions,
+            )
+
+            action_np = finalized.detach().cpu().numpy().astype("float64", copy=False)
+            action_np = apply_mp_action_rescaling_to_actions(
+                action_np,
+                task_descriptions,
+                frame_labels,
+                self._mp_rescaling_ctx,
+            )
+            finalized = torch.as_tensor(action_np, dtype=torch.float32)
+
+        return finalized
+
+    def _finalize_ik_pending(
+        self,
+        *,
+        task_descriptions: Sequence[str],
+        frame_labels: Sequence[int | None],
+    ) -> None:
+        if self._ik_pending is None:
+            return
+        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
+            return
+
+        from dataclasses import replace
+
+        from hybrid_eval.connectors.planning_target import PlanningTarget
+        from hybrid_eval.eval.mp_action_rescaling_rollout import (
+            apply_mp_action_rescaling_to_actions,
+        )
+
+        finalized_targets: list[PlanningTarget | None] = []
+        for row, target in enumerate(self._ik_pending.targets):
+            if target is None or not self._ik_pending.mask[row]:
+                finalized_targets.append(target)
+                continue
+
+            action_t = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
+            if self._rollout_postprocessor is not None:
+                action_t = self._rollout_postprocessor(action_t)
+            action_np = action_t.squeeze(0).detach().cpu().numpy().astype("float64", copy=False)
+
+            if self._mp_rescaling_ctx is not None:
+                label = frame_labels[row] if row < len(frame_labels) else None
+                task = task_descriptions[row] if row < len(task_descriptions) else ""
+                action_np = apply_mp_action_rescaling_to_actions(
+                    action_np.reshape(1, -1),
+                    [task],
+                    [label],
+                    self._mp_rescaling_ctx,
+                )[0]
+
+            finalized_targets.append(replace(target, action=action_np))
+
+        self._ik_pending.targets = finalized_targets
+
+    def _finalize_select_action_output(
+        self,
+        batch: dict[str, Tensor],
+        action: Tensor,
+    ) -> Tensor:
+        batch_size = int(action.shape[0])
+        task_descriptions = self._task_descriptions_for_batch(batch, batch_size)
+        frame_labels = self._frame_labels_for_batch(batch_size)
+        finalized = action.clone()
+
+        policy_rows = [
+            row
+            for row in range(batch_size)
+            if row >= len(self._last_step_ik_mask) or not self._last_step_ik_mask[row]
+        ]
+        if policy_rows:
+            row_index = torch.tensor(policy_rows, dtype=torch.long, device=action.device)
+            subset = self._finalize_rollout_action_tensor(
+                finalized[row_index],
+                task_descriptions=[task_descriptions[row] for row in policy_rows],
+                frame_labels=[frame_labels[row] for row in policy_rows],
+            )
+            finalized[row_index] = subset
+
+        self._finalize_ik_pending(
+            task_descriptions=task_descriptions,
+            frame_labels=frame_labels,
+        )
+        return finalized
 
     def set_rollout_step(self, step: int) -> None:
         """Set the current episode step index (used for chunk anchor bookkeeping)."""
@@ -256,22 +395,26 @@ class ACTSegmentPolicy(ACTPolicy):
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select one action per env; hybrid orchestrator routes MP triggers to dummy IK steps."""
         if not self.config.use_hybrid_orchestrator:
-            return super().select_action(batch)
-        
-        # Extract the batch size from the 'batch' dict, assuming any tensor value
-        first_tensor = next(v for v in batch.values() if isinstance(v, torch.Tensor))
-        actual_batch_size = first_tensor.shape[0]
-            
-        # we fix a batch size for ```select_action``` that is fixed until policy is reset
-        if self._select_action_batchsize is None:
-            self._select_action_batchsize = actual_batch_size
-        elif self._select_action_batchsize != actual_batch_size:
-            raise ValueError(
-                f"Batch size mismatch in select_action: expected {self._select_action_batchsize}, "
-                f"but got {actual_batch_size}. Batch size must remain fixed across calls until reset."
-            )
-     
-        return self._select_action_hybrid(batch)
+            action = super().select_action(batch)
+        else:
+            # Extract the batch size from the 'batch' dict, assuming any tensor value
+            first_tensor = next(v for v in batch.values() if isinstance(v, torch.Tensor))
+            actual_batch_size = first_tensor.shape[0]
+
+            # we fix a batch size for ```select_action``` that is fixed until policy is reset
+            if self._select_action_batchsize is None:
+                self._select_action_batchsize = actual_batch_size
+            elif self._select_action_batchsize != actual_batch_size:
+                raise ValueError(
+                    f"Batch size mismatch in select_action: expected {self._select_action_batchsize}, "
+                    f"but got {actual_batch_size}. Batch size must remain fixed across calls until reset."
+                )
+
+            action = self._select_action_hybrid(batch)
+
+        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
+            return action
+        return self._finalize_select_action_output(batch, action)
 
     def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
         from dataset.core.frame_labels import FrameLabelEnum
@@ -348,7 +491,7 @@ class ACTSegmentPolicy(ACTPolicy):
             self._chunk_anchor_steps[row] = self._rollout_step
 
             # Connector copies policy-output actions into PlanningTarget; unnormalization
-            # must happen in the eval rollout alongside the per-step select_action output.
+            # and MP inverse rescaling happen in select_action when rollout processors are set.
             actions_np = actions[i].detach().cpu().numpy()
             labels_np = labels[i].detach().cpu().numpy()
             targets = self._connector.planning_targets(actions_np, labels_np)
@@ -394,7 +537,7 @@ class ACTSegmentPolicy(ACTPolicy):
             if target is not None and id(target) not in self._executed_target_ids[row]:
                 if self.config.mp_executor_type == "ik_pose_setter":
                     # Dummy OSC action for this step; the real MP motion comes from
-                    # ``IkPending`` targets postprocessed in the eval rollout loop.
+                    # ``IkPending`` targets finalized inside :meth:`select_action`.
                     actions_out[row] = dummy
                     ik_targets[row] = target
                     ik_mask[row] = True
@@ -422,6 +565,7 @@ class ACTSegmentPolicy(ACTPolicy):
 
         self._ik_pending = IkPending(targets=ik_targets, mask=ik_mask)
         self._last_step_telemetry = step_telemetry
+        self._last_step_ik_mask = list(ik_mask)
         return actions_out
 
     def forward(
