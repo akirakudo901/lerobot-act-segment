@@ -40,7 +40,7 @@ from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.policies import make_policy, make_pre_post_processors
-from lerobot.scripts.lerobot_eval import eval_policy_all
+from lerobot.scripts.lerobot_eval import _configure_act_segment_rollout_processors, eval_policy_all
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
@@ -85,6 +85,7 @@ def eval_hybrid_viz_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
+    _configure_act_segment_rollout_processors(policy, cfg.policy, postprocessor)
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
