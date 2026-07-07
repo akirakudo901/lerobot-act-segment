@@ -111,6 +111,11 @@ class ACTSegmentPolicy(ACTPolicy):
                 "use_hybrid_orchestrator is incompatible with temporal_ensemble_coeff"
             )
 
+        if config.hybrid_refill_mode == "trust_near_mp" and config.hybrid_refill_mp_trust_steps < 0:
+            raise ValueError(
+                "hybrid_refill_mp_trust_steps must be >= 0 when hybrid_refill_mode is 'trust_near_mp'"
+            )
+
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
@@ -477,13 +482,36 @@ class ACTSegmentPolicy(ACTPolicy):
             return action
         return self._finalize_select_action_output(batch, action)
 
-    def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
+    def _first_mp_frame_index(self, labels_row: Tensor) -> int | None:
         from dataset.core.frame_labels import FrameLabelEnum
 
         for t in range(labels_row.shape[0]):
             if FrameLabelEnum.is_mp_frame_label(int(labels_row[t].item())):
-                return t + 1
-        return self.config.n_action_steps
+                return t
+        return None
+
+    def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
+        mode = self.config.hybrid_refill_mode
+        if mode == "full_chunk":
+            return self.config.n_action_steps
+
+        first_mp = self._first_mp_frame_index(labels_row)
+        if first_mp is None:
+            return self.config.n_action_steps
+
+        if mode == "until_first_mp":
+            return first_mp + 1
+
+        if mode == "trust_near_mp":
+            k = self.config.hybrid_refill_mp_trust_steps
+            if first_mp < k:
+                return first_mp + 1
+            return first_mp
+
+        raise ValueError(
+            f"Unknown hybrid_refill_mode {mode!r}; expected "
+            "'full_chunk', 'until_first_mp', or 'trust_near_mp'"
+        )
 
     def _refill_hybrid_rows(self, batch: dict[str, Tensor], rows: Sequence[int]) -> None:
         """
@@ -540,11 +568,7 @@ class ACTSegmentPolicy(ACTPolicy):
                         orchestrator_output=self._snapshot_chunk_output(row),
                     )
                 )
-            horizon = (
-                self._effective_chunk_horizon(labels[i])
-                if self.config.hybrid_refill_mode == "until_first_mp"
-                else self.config.n_action_steps
-            )
+            horizon = self._effective_chunk_horizon(labels[i])
             self._chunk_actions[row] = actions[i]
             self._chunk_labels[row] = labels[i]
             self._chunk_horizons[row] = horizon
