@@ -35,6 +35,8 @@ class ACTSegmentConfig(ACTConfig):
 
     label_feature_key: str = "frame_label_int"
     label_weight: float = 1.0
+    # Scales the MP execution-frame L1 term: weighted_l1 = l_l1_loss + mp_l1_weight * mp_l1_loss.
+    mp_l1_weight: float = 1.0
     num_label_classes: int = 4
 
     use_hybrid_orchestrator: bool = False
