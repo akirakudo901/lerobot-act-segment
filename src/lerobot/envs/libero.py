@@ -288,8 +288,10 @@ class LiberoEnv(gym.Env):
         its own clean EGL context rather than inheriting a stale one from the
         parent process (which causes EGL_BAD_CONTEXT crashes with AsyncVectorEnv).
         """
-        if self._env is not None:
+        # ControlEnv.close() deletes its inner ``env`` attribute; treat that as closed.
+        if self._env is not None and hasattr(self._env, "env"):
             return
+        self._env = None
         env = OffScreenRenderEnv(
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,
@@ -564,6 +566,7 @@ class LiberoEnv(gym.Env):
     def close(self):
         if self._env is not None:
             self._env.close()
+            self._env = None
 
 
 def _make_env_fns(
