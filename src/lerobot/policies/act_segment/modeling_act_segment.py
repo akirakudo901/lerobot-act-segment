@@ -224,6 +224,7 @@ class ACTSegmentPolicy(ACTPolicy):
             return action
 
         finalized = action
+        device = finalized.device
         if self._rollout_postprocessor is not None:
             finalized = self._rollout_postprocessor(finalized)
 
@@ -239,7 +240,7 @@ class ACTSegmentPolicy(ACTPolicy):
                 frame_labels,
                 self._mp_rescaling_ctx,
             )
-            finalized = torch.as_tensor(action_np, dtype=torch.float32)
+            finalized = torch.as_tensor(action_np, dtype=torch.float32, device=device)
 
         return finalized
 
