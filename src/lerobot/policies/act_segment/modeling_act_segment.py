@@ -190,14 +190,16 @@ class ACTSegmentPolicy(ACTPolicy):
         if mp_rescaling_ctx is not _UNSET_MP_RESCALING_CTX:
             self._mp_rescaling_ctx = mp_rescaling_ctx
 
-    def _task_descriptions_for_batch(
+    def _mp_rescaling_keys_for_batch(
         self,
         batch: dict[str, Tensor],
         batch_size: int,
     ) -> list[str]:
-        task = batch.get("task")
-        if task is None:
-            return [""] * batch_size
+        """Return ``task`` keys for MP rescaling registry lookup."""
+        if "task" not in batch:
+            raise KeyError("Key 'task' missing from batch in _mp_rescaling_keys_for_batch")
+        task = batch["task"]
+       
         if isinstance(task, (list, tuple)):
             tasks = [str(t) for t in task]
             if len(tasks) < batch_size:
@@ -217,7 +219,7 @@ class ACTSegmentPolicy(ACTPolicy):
         self,
         action: Tensor,
         *,
-        task_descriptions: Sequence[str],
+        mp_rescaling_keys: Sequence[str],
         frame_labels: Sequence[int | None],
     ) -> Tensor:
         if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
@@ -236,7 +238,7 @@ class ACTSegmentPolicy(ACTPolicy):
             action_np = finalized.detach().cpu().numpy().astype("float64", copy=False)
             action_np = apply_mp_action_rescaling_to_actions(
                 action_np,
-                task_descriptions,
+                mp_rescaling_keys,
                 frame_labels,
                 self._mp_rescaling_ctx,
             )
@@ -247,7 +249,7 @@ class ACTSegmentPolicy(ACTPolicy):
     def _finalize_ik_pending(
         self,
         *,
-        task_descriptions: Sequence[str],
+        mp_rescaling_keys: Sequence[str],
         frame_labels: Sequence[int | None],
     ) -> None:
         if self._ik_pending is None:
@@ -275,7 +277,7 @@ class ACTSegmentPolicy(ACTPolicy):
 
             if self._mp_rescaling_ctx is not None:
                 label = frame_labels[row] if row < len(frame_labels) else None
-                task = task_descriptions[row] if row < len(task_descriptions) else ""
+                task = mp_rescaling_keys[row] if row < len(mp_rescaling_keys) else ""
                 action_np = apply_mp_action_rescaling_to_actions(
                     action_np.reshape(1, -1),
                     [task],
@@ -293,7 +295,7 @@ class ACTSegmentPolicy(ACTPolicy):
         action: Tensor,
     ) -> Tensor:
         batch_size = int(action.shape[0])
-        task_descriptions = self._task_descriptions_for_batch(batch, batch_size)
+        mp_rescaling_keys = self._mp_rescaling_keys_for_batch(batch, batch_size)
         frame_labels = self._frame_labels_for_batch(batch_size)
         finalized = action.clone()
 
@@ -306,13 +308,13 @@ class ACTSegmentPolicy(ACTPolicy):
             row_index = torch.tensor(policy_rows, dtype=torch.long, device=action.device)
             subset = self._finalize_rollout_action_tensor(
                 finalized[row_index],
-                task_descriptions=[task_descriptions[row] for row in policy_rows],
+                mp_rescaling_keys=[mp_rescaling_keys[row] for row in policy_rows],
                 frame_labels=[frame_labels[row] for row in policy_rows],
             )
             finalized[row_index] = subset
 
         self._finalize_ik_pending(
-            task_descriptions=task_descriptions,
+            mp_rescaling_keys=mp_rescaling_keys,
             frame_labels=frame_labels,
         )
         return finalized

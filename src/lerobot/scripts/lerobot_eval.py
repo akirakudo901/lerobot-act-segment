@@ -98,6 +98,7 @@ from lerobot.utils.utils import (
 )
 
 
+# Hybrid-motion-planner extension (akirakudo901)
 def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
     """Return the env class providing batched IK observation helpers, if any."""
     try:
@@ -106,6 +107,7 @@ def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
         return None
 
 
+# Hybrid-motion-planner extension (akirakudo901)
 def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_cfg: Any, postprocessor) -> None:
     """Wire eval postprocessor into act_segment ``select_action``."""
     from lerobot.policies.act_segment.configuration_act_segment import ACTSegmentConfig
@@ -117,7 +119,7 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
     if callable(set_processors):
         set_processors(postprocessor)
 
-
+# Hybrid-motion-planner extension (akirakudo901)
 def _policy_handles_rollout_postprocess(policy: PreTrainedPolicy) -> bool:
     return getattr(policy, "_rollout_postprocessor", None) is not None or getattr(
         policy, "_mp_rescaling_ctx", None
@@ -210,6 +212,9 @@ def rollout(
                 observation["task"] = list(env.call("task"))
             except (AttributeError, NotImplementedError):
                 observation["task"] = [""] * env.num_envs
+        
+        # Hybrid-motion-planner extension (akirakudo901): populate mp-rescaling keys for hybrid rollouts
+        observation["mp_rescale_key"] = list(env.call("task"))
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
