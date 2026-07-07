@@ -65,7 +65,7 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
-from .lerobot_eval import eval_policy_all
+from .lerobot_eval import _configure_act_segment_rollout_processors, eval_policy_all
 
 
 def update_policy(
@@ -492,6 +492,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+    # Hybrid-motion-planner extension (akirakudo901)
+    if (
+        is_main_process
+        and cfg.env is not None
+        and cfg.eval_freq > 0
+        and not cfg.is_reward_model_training
+    ):
+        _configure_act_segment_rollout_processors(
+            accelerator.unwrap_model(policy),
+            cfg.policy,
+            postprocessor,
+        )
+    # Hybrid-motion-planner extension (akirakudo901) END
     dl_iter = cycle(dataloader)
 
     policy.train()
