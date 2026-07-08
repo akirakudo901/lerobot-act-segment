@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -155,6 +158,8 @@ def from_tensor_to_numpy(x: torch.Tensor | Any) -> np.ndarray | float | int | An
 
 _COMPLEMENTARY_KEYS = (
     "task",
+    # Hybrid-motion-planner extension (akirakudo901)
+    "mp_rescale_key",
     "index",
     "task_index",
     "episode_index",

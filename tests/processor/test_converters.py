@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 import numpy as np
 import pytest
 import torch
@@ -270,6 +273,21 @@ def testtransition_to_batch_with_index_fields():
     assert torch.equal(batch["index"], transition[TransitionKey.COMPLEMENTARY_DATA]["index"])
     assert torch.equal(batch["task_index"], transition[TransitionKey.COMPLEMENTARY_DATA]["task_index"])
     assert batch["task"] == transition[TransitionKey.COMPLEMENTARY_DATA]["task"]
+
+# Hybrid-motion-planner extension (akirakudo901)
+def test_batch_to_transition_with_mp_rescale_key():
+    """mp_rescale_key survives batch <-> transition conversion for eval rollouts."""
+    batch = {
+        OBS_STATE: torch.randn(2, 8),
+        "mp_rescale_key": ["KITCHEN_SCENE6_close_the_microwave", "KITCHEN_SCENE6_close_the_microwave"],
+    }
+
+    transition = batch_to_transition(batch)
+    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+    assert comp_data["mp_rescale_key"] == batch["mp_rescale_key"]
+
+    roundtrip = transition_to_batch(transition)
+    assert roundtrip["mp_rescale_key"] == batch["mp_rescale_key"]
 
 
 def test_batch_to_transition_without_index_fields():

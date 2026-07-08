@@ -195,17 +195,23 @@ class ACTSegmentPolicy(ACTPolicy):
         batch: dict[str, Tensor],
         batch_size: int,
     ) -> list[str]:
-        """Return ``task`` keys for MP rescaling registry lookup."""
-        if "task" not in batch:
-            raise KeyError("Key 'task' missing from batch in _mp_rescaling_keys_for_batch")
-        task = batch["task"]
-       
-        if isinstance(task, (list, tuple)):
-            tasks = [str(t) for t in task]
-            if len(tasks) < batch_size:
-                tasks.extend([""] * (batch_size - len(tasks)))
-            return tasks[:batch_size]
-        return [str(task)] * batch_size
+        """Return registry lookup keys for MP inverse-rescaling.
+
+        Require ``mp_rescale_key`` (LIBERO task stem from eval).
+        """
+        if "mp_rescale_key" in batch:
+            keys_source = batch["mp_rescale_key"]
+        else:
+            raise KeyError(
+                "Key 'mp_rescale_key' required in batch for _mp_rescaling_keys_for_batch"
+            )
+
+        if isinstance(keys_source, (list, tuple)):
+            keys = [str(key) for key in keys_source]
+            if len(keys) < batch_size:
+                keys.extend([""] * (batch_size - len(keys)))
+            return keys[:batch_size]
+        return [str(keys_source)] * batch_size
 
     def _frame_labels_for_batch(self, batch_size: int) -> list[int | None]:
         labels: list[int | None] = [
