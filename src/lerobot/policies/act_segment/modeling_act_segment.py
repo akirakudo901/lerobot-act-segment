@@ -406,6 +406,26 @@ class ACTSegmentPolicy(ACTPolicy):
             return ~batch[pad_key]
         return ~batch["action_is_pad"]
 
+    def _masked_l1_mean(self, abs_err: Tensor, mask: Tensor) -> Tensor:
+        num_valid = mask.sum() * abs_err.shape[-1]
+        return (abs_err * mask).sum() / num_valid.clamp_min(1)
+
+    def _mp_l_action_masks(self, batch: dict[str, Tensor], action_valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+        """MP mask = MP-labeled valid steps; L mask = L-labeled valid steps."""
+        from dataset.core.frame_labels import FrameLabelEnum
+        import numpy as np
+
+        labels = self._label_targets(batch)
+        label_valid_mask = self._label_valid_mask(batch)
+        step_valid = action_valid_mask.squeeze(-1) & label_valid_mask
+
+        mp_mask = FrameLabelEnum.is_mp_frame_label_array(labels)
+        l_mask = FrameLabelEnum.is_l_frame_label_array(labels)
+        mp_step = step_valid & mp_mask
+        l_step = step_valid & l_mask
+
+        return mp_step.unsqueeze(-1), l_step.unsqueeze(-1)
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
@@ -617,8 +637,10 @@ class ACTSegmentPolicy(ACTPolicy):
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         action_valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        num_valid_actions = action_valid_mask.sum() * abs_err.shape[-1]
-        l1_loss = (abs_err * action_valid_mask).sum() / num_valid_actions.clamp_min(1)
+        mp_action_mask, l_action_mask = self._mp_l_action_masks(batch, action_valid_mask)
+        mp_l1_loss = self._masked_l1_mean(abs_err, mp_action_mask)
+        l_l1_loss = self._masked_l1_mean(abs_err, l_action_mask)
+        weighted_l1_loss = l_l1_loss + self.config.mp_l1_weight * mp_l1_loss
 
         label_targets = self._label_targets(batch)
         label_valid_mask = self._label_valid_mask(batch)
@@ -634,7 +656,9 @@ class ACTSegmentPolicy(ACTPolicy):
         label_accuracy = ((preds == label_targets) & label_valid_mask).sum().float() / num_valid_labels
 
         loss_dict = {
-            "l1_loss": l1_loss.item(),
+            "mp_l1_loss": mp_l1_loss.item(),
+            "l_l1_loss": l_l1_loss.item(),
+            "weighted_l1_loss": weighted_l1_loss.item(),
             "label_ce_loss": label_ce_loss.item(),
             "label_accuracy": label_accuracy.item(),
         }
@@ -644,8 +668,12 @@ class ACTSegmentPolicy(ACTPolicy):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight + label_ce_loss * self.config.label_weight
+            loss = (
+                weighted_l1_loss
+                + mean_kld * self.config.kl_weight
+                + label_ce_loss * self.config.label_weight
+            )
         else:
-            loss = l1_loss + label_ce_loss * self.config.label_weight
+            loss = weighted_l1_loss + label_ce_loss * self.config.label_weight
 
         return loss, loss_dict
