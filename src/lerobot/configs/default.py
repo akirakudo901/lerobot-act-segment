@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
 from dataclasses import dataclass, field
 
 from lerobot.transforms import ImageTransformsConfig
@@ -39,6 +42,12 @@ class DatasetConfig:
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
     streaming: bool = False
+    # Augmentation-ready LIBERO train-time transforms (post-load MP shift/relabel/rescale).
+    enable_mp_aug_ready_transforms: bool = False
+    mp_shift_max: int = 0
+    rescale_mp_actions: bool = True
+    mp_rescaling_strategy: str | None = None
+    mp_rescaling_min_samples: int = 5
 
     def __post_init__(self) -> None:
         if self.episodes is not None:
@@ -49,6 +58,11 @@ class DatasetConfig:
             if len(self.episodes) != len(set(self.episodes)):
                 duplicates = sorted({ep for ep in self.episodes if self.episodes.count(ep) > 1})
                 raise ValueError(f"Episode indices contain duplicates: {duplicates}")
+        if self.enable_mp_aug_ready_transforms and self.mp_shift_max < 0:
+            raise ValueError(
+                f"mp_shift_max must be >= 0 when augmentation-ready transforms are enabled, "
+                f"got {self.mp_shift_max}"
+            )
 
 
 @dataclass
