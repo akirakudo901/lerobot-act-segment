@@ -17,6 +17,7 @@
 # MODIFIED BY akirakudo901 for the hybrid-motion-planner project
 # see: https://github.com/akirakudo901/lerobot-act-segment
 import logging
+from pathlib import Path
 from pprint import pformat
 
 import torch
@@ -32,6 +33,53 @@ from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
+
+
+def _maybe_wrap_mp_aug_ready_dataset(
+    dataset: LeRobotDataset | MultiLeRobotDataset,
+    dataset_cfg: DatasetConfig,
+    trainable_config: PreTrainedConfig | RewardModelConfig,
+    *,
+    enable_augmentation: bool,
+    rescaling_registry_path: str | Path | None = None,
+) -> LeRobotDataset | MultiLeRobotDataset:
+    if not dataset_cfg.enable_mp_aug_ready_transforms:
+        return dataset
+    if isinstance(dataset, MultiLeRobotDataset):
+        raise NotImplementedError(
+            "Augmentation-ready transforms are not supported for MultiLeRobotDataset."
+        )
+    if dataset_cfg.streaming:
+        raise NotImplementedError(
+            "Augmentation-ready transforms require non-streaming LeRobotDataset."
+        )
+
+    from dataset.loaders.mp_aug_ready_train_dataset import wrap_mp_aug_ready_dataset
+
+    chunk_size = getattr(trainable_config, "chunk_size", None)
+    if chunk_size is None:
+        raise ValueError(
+            "enable_mp_aug_ready_transforms requires trainable_config.chunk_size "
+            "(e.g. act_segment policy)."
+        )
+
+    dataset_root = Path(dataset.root) if dataset.root is not None else None
+    logging.info(
+        "Wrapping augmentation-ready dataset at %s (mp_shift_max=%d, augment=%s)",
+        dataset_root,
+        dataset_cfg.mp_shift_max,
+        enable_augmentation,
+    )
+    return wrap_mp_aug_ready_dataset(
+        dataset,
+        chunk_size=int(chunk_size),
+        mp_shift_max=int(dataset_cfg.mp_shift_max),
+        enable_augmentation=enable_augmentation,
+        rescale_mp_actions=dataset_cfg.rescale_mp_actions,
+        rescaling_strategy=dataset_cfg.mp_rescaling_strategy,
+        min_rescale_samples=dataset_cfg.mp_rescaling_min_samples,
+        rescaling_registry_path=rescaling_registry_path,
+    )
 
 
 def resolve_delta_timestamps(
@@ -90,6 +138,8 @@ def make_dataset_from_config(
     num_workers: int,
     episodes: list[int] | None = None,
     enable_image_transforms: bool | None = None,
+    enable_mp_aug_ready_augmentation: bool = True,
+    mp_aug_rescaling_registry_path: str | Path | None = None,
 ) -> LeRobotDataset | MultiLeRobotDataset:
     """Build a dataset from a DatasetConfig with optional episode/transform overrides."""
     use_transforms = (
@@ -150,10 +200,20 @@ def make_dataset_from_config(
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
-    return dataset
+    return _maybe_wrap_mp_aug_ready_dataset(
+        dataset,
+        dataset_cfg,
+        trainable_config,
+        enable_augmentation=enable_mp_aug_ready_augmentation,
+        rescaling_registry_path=mp_aug_rescaling_registry_path,
+    )
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+def make_dataset(
+    cfg: TrainPipelineConfig,
+    *,
+    mp_aug_rescaling_registry_path: str | Path | None = None,
+) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -170,12 +230,16 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         cfg.trainable_config,
         tolerance_s=cfg.tolerance_s,
         num_workers=cfg.num_workers,
+        enable_mp_aug_ready_augmentation=True,
+        mp_aug_rescaling_registry_path=mp_aug_rescaling_registry_path,
     )
 
 
 def make_val_dataset(
     cfg: TrainPipelineConfig,
     val_episodes: list[int] | None = None,
+    *,
+    mp_aug_rescaling_registry_path: str | Path | None = None,
 ) -> LeRobotDataset | MultiLeRobotDataset:
     """Build the offline validation dataset without image augmentations."""
     if cfg.val_dataset is not None:
@@ -185,6 +249,8 @@ def make_val_dataset(
             tolerance_s=cfg.tolerance_s,
             num_workers=cfg.num_workers,
             enable_image_transforms=False,
+            enable_mp_aug_ready_augmentation=False,
+            mp_aug_rescaling_registry_path=mp_aug_rescaling_registry_path,
         )
 
     if val_episodes is None:
@@ -197,4 +263,6 @@ def make_val_dataset(
         num_workers=cfg.num_workers,
         episodes=val_episodes,
         enable_image_transforms=False,
+        enable_mp_aug_ready_augmentation=False,
+        mp_aug_rescaling_registry_path=mp_aug_rescaling_registry_path,
     )

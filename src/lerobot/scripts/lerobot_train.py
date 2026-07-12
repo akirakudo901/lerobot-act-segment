@@ -25,6 +25,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -260,15 +261,45 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         elif cfg.val_dataset is not None and cfg.val_dataset.episodes is not None:
             val_episodes_resolved = list(cfg.val_dataset.episodes)
 
+    mp_aug_rescaling_registry_path: str | Path | None = None
+    if cfg.dataset.enable_mp_aug_ready_transforms and not cfg.is_reward_model_training:
+        from dataset.core.mp_action_rescaling import MP_ACTION_RESCALING_METADATA_PATH
+
+        mp_aug_rescaling_registry_path = cfg.output_dir / MP_ACTION_RESCALING_METADATA_PATH
+
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        if mp_aug_rescaling_registry_path is not None:
+            from dataset.loaders.mp_aug_ready_train_dataset import (
+                MpAugReadyTrainDataset,
+                recompute_mp_aug_ready_stats,
+            )
+
+            if isinstance(dataset, MpAugReadyTrainDataset):
+                saved = dataset.save_rescaling_registry(mp_aug_rescaling_registry_path)
+                if saved is not None and hasattr(cfg.policy, "mp_action_rescaling_registry_path"):
+                    cfg.policy.mp_action_rescaling_registry_path = str(saved)
+                    logging.info(
+                        "Saved MP action rescaling registry to %s",
+                        cfg.policy.mp_action_rescaling_registry_path,
+                    )
+                recompute_mp_aug_ready_stats(dataset)
+                logging.info(
+                    "Recomputed train stats for augmentation-ready virtual dataset "
+                    "(%d frames, %d episodes)",
+                    dataset.num_frames,
+                    dataset.num_episodes,
+                )
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        dataset = make_dataset(
+            cfg,
+            mp_aug_rescaling_registry_path=mp_aug_rescaling_registry_path,
+        )
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -428,7 +459,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     val_dataloader = None
     if cfg.val_freq > 0 and not cfg.is_reward_model_training and is_main_process:
         val_batch_size = cfg.val_batch_size if cfg.val_batch_size > 0 else cfg.batch_size
-        val_dataset = make_val_dataset(cfg, val_episodes=val_episodes_resolved)
+        val_dataset = make_val_dataset(
+            cfg,
+            val_episodes=val_episodes_resolved,
+            mp_aug_rescaling_registry_path=mp_aug_rescaling_registry_path,
+        )
         if val_episodes_resolved is None and is_main_process:
             n_val = len(val_dataset.episodes) if val_dataset.episodes is not None else val_dataset.num_episodes
             logging.info(f"Offline val dataset loaded: val_episodes={n_val}")
