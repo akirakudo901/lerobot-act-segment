@@ -37,7 +37,12 @@ from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
-from lerobot.common.offline_eval_utils import compute_offline_val_loss, resolve_train_val_episodes
+from lerobot.common.offline_eval_utils import (
+    build_episode_span_tables,
+    compute_offline_val_loss,
+    compute_offline_val_segment_loss,
+    resolve_train_val_episodes,
+)
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -457,6 +462,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 )
 
     val_dataloader = None
+    val_dataset = None
+    val_episode_spans = None
     if cfg.val_freq > 0 and not cfg.is_reward_model_training and is_main_process:
         val_batch_size = cfg.val_batch_size if cfg.val_batch_size > 0 else cfg.batch_size
         val_dataset = make_val_dataset(
@@ -467,6 +474,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if val_episodes_resolved is None and is_main_process:
             n_val = len(val_dataset.episodes) if val_dataset.episodes is not None else val_dataset.num_episodes
             logging.info(f"Offline val dataset loaded: val_episodes={n_val}")
+        if cfg.policy.type == "act_segment":
+            label_feature_key = getattr(cfg.policy, "label_feature_key", "frame_label_int")
+            val_episode_spans = build_episode_span_tables(
+                val_dataset,
+                label_feature_key=label_feature_key,
+            )
         if hasattr(active_cfg, "drop_n_last_frames"):
             val_sampler = EpisodeAwareSampler(
                 val_dataset.meta.episodes["dataset_from_index"],
@@ -649,6 +662,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     accelerator=accelerator,
                     camera_keys=dataset.meta.camera_keys,
                 )
+                if cfg.policy.type == "act_segment" and val_episode_spans is not None:
+                    segment_metrics = compute_offline_val_segment_loss(
+                        policy=policy,
+                        val_dataloader=val_dataloader,
+                        val_dataset=val_dataset,
+                        preprocessor=preprocessor,
+                        accelerator=accelerator,
+                        camera_keys=dataset.meta.camera_keys,
+                        episode_spans=val_episode_spans,
+                        label_delta_indices=cfg.policy.label_delta_indices,
+                    )
+                    val_metrics.update(segment_metrics)
                 metrics_str = " ".join(
                     f"{k}:{v:.3f}" if isinstance(v, float) and k != "val_batches" else f"{k}:{v}"
                     for k, v in val_metrics.items()
