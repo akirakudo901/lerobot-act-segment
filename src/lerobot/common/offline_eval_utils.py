@@ -17,10 +17,13 @@
 # IMPLEMENTED BY akirakudo901 for the hybrid-motion-planner project
 # see: https://github.com/akirakudo901/lerobot-act-segment
 
+import logging
 import random
 import time
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -30,6 +33,14 @@ from lerobot.utils.logging_utils import AverageMeter
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
+    from dataset.core.types import SegmentLabel
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+logger = logging.getLogger(__name__)
+
+EpisodeSpan = tuple[int, int, "SegmentLabel"]
+EpisodeSpanTable = dict[int, list[EpisodeSpan]]
+FrameLossKey = tuple[int, int]
 
 
 def resolve_episode_pool(episodes: list[int] | None, total_episodes: int) -> list[int]:
@@ -132,4 +143,256 @@ def compute_offline_val_loss(
     metrics = {key: meter.avg for key, meter in meters.items()}
     metrics["val_s"] = time.perf_counter() - start_time
     metrics["val_batches"] = float(n_batches)
+    return metrics
+
+
+def episode_pattern(spans: list[EpisodeSpan]) -> str:
+    """Ordered MP/L pattern string, e.g. ``MP-L-MP``."""
+    return "-".join(label for _, _, label in spans)
+
+
+def local_frame_to_span_idx(local_frame: int, spans: list[EpisodeSpan]) -> int | None:
+    """Return the span index containing ``local_frame``, or ``None`` if unlabeled."""
+    for span_idx, (start, end, _label) in enumerate(spans):
+        if start <= local_frame < end:
+            return span_idx
+    return None
+
+
+def _episode_indices_for_span_tables(val_dataset: "LeRobotDataset") -> list[int]:
+    if val_dataset.episodes is not None:
+        return list(val_dataset.episodes)
+    return list(range(val_dataset.num_episodes))
+
+
+def _build_virtual_episode_span_tables(val_dataset: object) -> EpisodeSpanTable:
+    """Build span tables from MpAugReadyTrainDataset virtual segments."""
+    from dataset.core.segments import iter_labeled_spans
+
+    episode_indices = set(_episode_indices_for_span_tables(val_dataset))
+    episode_spans: EpisodeSpanTable = {}
+    for segment in val_dataset._virtual_segments:
+        episode_index = int(segment.virtual_episode_index)
+        if episode_index not in episode_indices:
+            continue
+        episode_spans[episode_index] = list(iter_labeled_spans(segment.frame_labels_int))
+    return episode_spans
+
+
+def build_episode_span_tables(
+    val_dataset: "LeRobotDataset",
+    *,
+    label_feature_key: str = "frame_label_int",
+) -> EpisodeSpanTable | None:
+    """Precompute GT MP/L spans for each validation episode."""
+    if label_feature_key not in val_dataset.features:
+        logger.warning(
+            "Skipping segment validation metrics: dataset missing feature %r.",
+            label_feature_key,
+        )
+        return None
+
+    if hasattr(val_dataset, "_virtual_segments"):
+        return _build_virtual_episode_span_tables(val_dataset)
+
+    from dataset.core.segments import iter_labeled_spans
+
+    episodes_meta = val_dataset.meta.episodes
+    if episodes_meta is None:
+        from lerobot.datasets.io_utils import load_episodes
+
+        episodes_meta = load_episodes(val_dataset.root)
+    episode_indices = _episode_indices_for_span_tables(val_dataset)
+    hf_dataset = val_dataset.hf_dataset.with_format("numpy")
+    reader = val_dataset._ensure_reader()
+    abs_to_rel = reader._absolute_to_relative_idx
+
+    episode_spans: EpisodeSpanTable = {}
+    for episode_index in episode_indices:
+        from_idx = int(episodes_meta["dataset_from_index"][episode_index])
+        to_idx = int(episodes_meta["dataset_to_index"][episode_index])
+        if abs_to_rel is not None:
+            rel_indices = [
+                abs_to_rel[abs_idx]
+                for abs_idx in range(from_idx, to_idx)
+                if abs_idx in abs_to_rel
+            ]
+            if not rel_indices:
+                episode_spans[episode_index] = []
+                continue
+            labels = np.asarray(
+                [
+                    int(np.asarray(hf_dataset[row_idx][label_feature_key]).reshape(-1)[0])
+                    for row_idx in rel_indices
+                ],
+                dtype=np.uint8,
+            )
+        else:
+            labels = np.asarray(hf_dataset[label_feature_key][from_idx:to_idx], dtype=np.uint8).ravel()
+        episode_spans[episode_index] = list(iter_labeled_spans(labels))
+
+    return episode_spans
+
+
+def _accumulate_deduped_frame_losses(
+    frame_action_sums: dict[FrameLossKey, float],
+    frame_action_counts: dict[FrameLossKey, int],
+    frame_ce_sums: dict[FrameLossKey, float],
+    frame_ce_counts: dict[FrameLossKey, int],
+    *,
+    episode_index: int,
+    local_frame: int,
+    action_l1: float,
+    label_ce: float,
+) -> None:
+    key = (episode_index, local_frame)
+    frame_action_sums[key] = frame_action_sums.get(key, 0.0) + action_l1
+    frame_action_counts[key] = frame_action_counts.get(key, 0) + 1
+    frame_ce_sums[key] = frame_ce_sums.get(key, 0.0) + label_ce
+    frame_ce_counts[key] = frame_ce_counts.get(key, 0) + 1
+
+
+def aggregate_segment_val_metrics(
+    episode_spans: EpisodeSpanTable,
+    frame_action_sums: dict[FrameLossKey, float],
+    frame_action_counts: dict[FrameLossKey, int],
+    frame_ce_sums: dict[FrameLossKey, float],
+    frame_ce_counts: dict[FrameLossKey, int],
+) -> dict[str, float]:
+    """Aggregate deduped per-frame losses into span, pattern, and segment-type metrics."""
+    type_action_values: dict[str, list[float]] = defaultdict(list)
+    type_ce_values: dict[str, list[float]] = defaultdict(list)
+    pattern_action_values: dict[tuple[str, int, str], list[float]] = defaultdict(list)
+    pattern_ce_values: dict[tuple[str, int, str], list[float]] = defaultdict(list)
+
+    contributing_episodes = 0
+    for episode_index, spans in episode_spans.items():
+        if not spans:
+            continue
+
+        episode_had_span_loss = False
+        pattern_key = episode_pattern(spans)
+        for span_idx, (start, end, label) in enumerate(spans):
+            action_values: list[float] = []
+            ce_values: list[float] = []
+            for local_frame in range(start, end):
+                key = (episode_index, local_frame)
+                if key not in frame_action_counts:
+                    continue
+                action_values.append(frame_action_sums[key] / frame_action_counts[key])
+                ce_values.append(frame_ce_sums[key] / frame_ce_counts[key])
+
+            if not action_values:
+                continue
+
+            episode_had_span_loss = True
+            span_action_l1 = float(np.mean(action_values))
+            span_label_ce = float(np.mean(ce_values))
+            type_action_values[label].append(span_action_l1)
+            type_ce_values[label].append(span_label_ce)
+            pattern_action_values[(pattern_key, span_idx, label)].append(span_action_l1)
+            pattern_ce_values[(pattern_key, span_idx, label)].append(span_label_ce)
+
+        if episode_had_span_loss:
+            contributing_episodes += 1
+
+    metrics: dict[str, float] = {
+        "segment_val_episodes": float(contributing_episodes),
+        "segment_val_frames": float(len(frame_action_counts)),
+    }
+
+    for label, values in type_action_values.items():
+        metrics[f"segment_type/{label}/action_l1"] = float(np.mean(values))
+    for label, values in type_ce_values.items():
+        metrics[f"segment_type/{label}/label_ce"] = float(np.mean(values))
+
+    for (pattern_key, span_idx, label), values in pattern_action_values.items():
+        metrics[f"pattern/{pattern_key}/span{span_idx}_{label}/action_l1"] = float(np.mean(values))
+    for (pattern_key, span_idx, label), values in pattern_ce_values.items():
+        metrics[f"pattern/{pattern_key}/span{span_idx}_{label}/label_ce"] = float(np.mean(values))
+
+    return metrics
+
+
+def compute_offline_val_segment_loss(
+    policy: PreTrainedPolicy,
+    val_dataloader: DataLoader,
+    val_dataset: "LeRobotDataset",
+    preprocessor: PolicyProcessorPipeline,
+    accelerator: "Accelerator",
+    camera_keys: list[str],
+    episode_spans: EpisodeSpanTable,
+    label_delta_indices: list[int],
+) -> dict[str, float]:
+    """Run segment-aware validation and return MP/L span and pattern metrics."""
+    from lerobot.policies.act_segment.modeling_act_segment import ACTSegmentPolicy
+
+    unwrapped = accelerator.unwrap_model(policy)
+    if not isinstance(unwrapped, ACTSegmentPolicy):
+        raise TypeError(
+            "compute_offline_val_segment_loss requires ACTSegmentPolicy, "
+            f"got {type(unwrapped).__name__}."
+        )
+
+    was_training = unwrapped.training
+    unwrapped.eval()
+
+    frame_action_sums: dict[FrameLossKey, float] = {}
+    frame_action_counts: dict[FrameLossKey, int] = {}
+    frame_ce_sums: dict[FrameLossKey, float] = {}
+    frame_ce_counts: dict[FrameLossKey, int] = {}
+    start_time = time.perf_counter()
+
+    with torch.no_grad(), accelerator.autocast():
+        for batch in val_dataloader:
+            if batch is None:
+                continue
+            episode_indices = batch["episode_index"].tolist()
+            frame_indices = batch["frame_index"].tolist()
+
+            for cam_key in camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            batch = preprocessor(batch)
+
+            action_l1, label_ce, valid_mask = unwrapped.per_step_val_losses(batch)
+            batch_size = len(episode_indices)
+
+            for row in range(batch_size):
+                episode_index = int(episode_indices[row])
+                spans = episode_spans.get(episode_index)
+                if spans is None:
+                    continue
+
+                anchor_frame = int(frame_indices[row])
+                for step_idx, delta in enumerate(label_delta_indices):
+                    if step_idx >= valid_mask.shape[1] or not bool(valid_mask[row, step_idx].item()):
+                        continue
+
+                    local_frame = anchor_frame + int(delta)
+                    if local_frame_to_span_idx(local_frame, spans) is None:
+                        continue
+
+                    _accumulate_deduped_frame_losses(
+                        frame_action_sums,
+                        frame_action_counts,
+                        frame_ce_sums,
+                        frame_ce_counts,
+                        episode_index=episode_index,
+                        local_frame=local_frame,
+                        action_l1=float(action_l1[row, step_idx].item()),
+                        label_ce=float(label_ce[row, step_idx].item()),
+                    )
+
+    if was_training:
+        unwrapped.train()
+
+    metrics = aggregate_segment_val_metrics(
+        episode_spans,
+        frame_action_sums,
+        frame_action_counts,
+        frame_ce_sums,
+        frame_ce_counts,
+    )
+    metrics["segment_val_s"] = time.perf_counter() - start_time
     return metrics
