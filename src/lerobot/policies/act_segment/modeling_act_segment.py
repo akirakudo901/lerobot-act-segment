@@ -626,6 +626,38 @@ class ACTSegmentPolicy(ACTPolicy):
         self._last_step_ik_mask = list(ik_mask)
         return actions_out
 
+    @torch.no_grad()
+    def per_step_val_losses(
+        self,
+        batch: dict[str, Tensor],
+        sample_encoded_dist: bool | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return per-chunk-step action L1 and label CE for offline segment validation.
+
+        Returns:
+            action_l1: ``[B, T]`` mean L1 over action dims per valid step.
+            label_ce: ``[B, T]`` cross-entropy per valid step.
+            valid_mask: ``[B, T]`` bool mask (action and label both valid).
+        """
+        batch = self._prepare_batch(batch)
+        sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
+        actions_hat, labels_logits, _vae_params = self.model(batch, sample_encoded_dist)
+
+        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
+        action_valid_mask = ~batch["action_is_pad"]
+        action_l1 = abs_err.mean(dim=-1)
+
+        label_targets = self._label_targets(batch)
+        label_valid_mask = self._label_valid_mask(batch)
+        per_step_ce = F.cross_entropy(
+            labels_logits.reshape(-1, self.config.num_label_classes),
+            label_targets.reshape(-1),
+            reduction="none",
+        ).view(labels_logits.shape[0], labels_logits.shape[1])
+
+        valid_mask = action_valid_mask & label_valid_mask
+        return action_l1, per_step_ce, valid_mask
+
     def forward(
         self,
         batch: dict[str, Tensor],
