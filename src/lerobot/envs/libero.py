@@ -563,6 +563,67 @@ class LiberoEnv(gym.Env):
             return
         self.execute_ik(targets[idx], np.asarray(poses[idx], dtype=np.float64))
 
+    def plan_ompl(
+        self,
+        start_ee_pose: np.ndarray,
+        goal_ee_pose: np.ndarray,
+        *,
+        algorithm: str = "RRTConnect",
+        time_limit: float = 1.0,
+        include_grasped_object_in_validity: bool = False,
+        on_ik_failure: str = "raise",
+        max_ee_step_m: float = 0.02,
+        path_interpolate_count: int | None = 50,
+    ) -> dict[str, Any] | None:
+        """Worker RPC shim: bind ``self`` as ``replay_env`` for Layer-1 OMPL."""
+        from lerobot.envs.hybrid_mp_planning import plan_ompl as plan_ompl_on_env
+
+        return plan_ompl_on_env(
+            self,
+            start_ee_pose,
+            goal_ee_pose,
+            algorithm=algorithm,
+            time_limit=time_limit,
+            include_grasped_object_in_validity=include_grasped_object_in_validity,
+            on_ik_failure=on_ik_failure,
+            max_ee_step_m=max_ee_step_m,
+            path_interpolate_count=path_interpolate_count,
+        )
+
+    def plan_ompl_indexed(
+        self,
+        targets: Sequence[Any | None],
+        poses: Sequence[np.ndarray],
+        mask: Sequence[bool],
+        *,
+        algorithm: str = "RRTConnect",
+        time_limit: float = 1.0,
+        include_grasped_object_in_validity: bool = False,
+        on_ik_failure: str = "raise",
+        max_ee_step_m: float = 0.02,
+        path_interpolate_count: int | None = 50,
+        pos_scale: float = 0.05,
+        rot_scale: float = 0.5,
+    ) -> dict[str, Any] | None:
+        """Worker RPC shim for batched ``VectorEnv.call('plan_ompl_indexed', ...)``."""
+        from lerobot.envs.hybrid_mp_planning import plan_ompl_indexed as plan_ompl_indexed_on_env
+
+        return plan_ompl_indexed_on_env(
+            self,
+            self.episode_index,
+            targets,
+            poses,
+            mask,
+            algorithm=algorithm,
+            time_limit=time_limit,
+            include_grasped_object_in_validity=include_grasped_object_in_validity,
+            on_ik_failure=on_ik_failure,
+            max_ee_step_m=max_ee_step_m,
+            path_interpolate_count=path_interpolate_count,
+            pos_scale=pos_scale,
+            rot_scale=rot_scale,
+        )
+
     def close(self):
         if self._env is not None:
             self._env.close()
