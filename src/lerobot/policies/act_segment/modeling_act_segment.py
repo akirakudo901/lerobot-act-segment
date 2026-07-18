@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
@@ -68,6 +69,9 @@ class HybridStepTelemetry:
     action_source: str
     is_new_chunk: bool
     chunk_anchor_step: int
+    ee_waypoint: tuple[float, ...] | None = None
+    ompl_waypoint_index: int | None = None
+    ompl_plan_done: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,6 +183,13 @@ class ACTSegmentPolicy(ACTPolicy):
         self._last_step_telemetry: list[HybridStepTelemetry | None] = []
         self._completed_chunks: list[HybridChunkTelemetry] = []
         self._last_step_ik_mask: list[bool] = []
+        self._last_step_skip_postprocess_mask: list[bool] = []
+        self._ompl_trackers: list[Any | None] = []
+        # Intentionally not cleared on reset: wired once via bind_eval_env for the VectorEnv lifetime.
+        if not hasattr(self, "_eval_vector_env"):
+            self._eval_vector_env: Any | None = None
+        if not hasattr(self, "_dummy_action"):
+            self._dummy_action: Sequence[float] | None = None
 
     def set_rollout_action_processors(
         self,
@@ -194,6 +205,21 @@ class ACTSegmentPolicy(ACTPolicy):
         self._rollout_postprocessor = postprocessor
         if mp_rescaling_ctx is not _UNSET_MP_RESCALING_CTX:
             self._mp_rescaling_ctx = mp_rescaling_ctx
+
+    def set_dummy_action(self, action: Sequence[float] | None) -> None:
+        """Override the no-op action used for ``ik_pose_setter`` MP trigger frames."""
+        self._dummy_action = None if action is None else list(action)
+
+    def bind_eval_env(self, env: Any | None) -> None:
+        """Associate this policy with a VectorEnv for hybrid MP (Layer-1 OMPL RPC).
+
+        For ``mp_executor_type='ompl_waypoints'``, ``_select_action_hybrid`` calls
+        ``env.call('plan_ompl_indexed', ...)`` on MP triggers. Worker envs must expose
+        that method (thin shim over :func:`lerobot.envs.hybrid_mp_planning.plan_ompl_indexed`).
+
+        Pass ``env=None`` to clear the association.
+        """
+        self._eval_vector_env = env
 
     def _mp_rescaling_keys_for_batch(
         self,
@@ -313,10 +339,12 @@ class ACTSegmentPolicy(ACTPolicy):
             mp_rescaling_keys = [""] * batch_size
         finalized = action.clone()
 
+        # Prefer explicit skip mask (OMPL OSC + IK dummy); fall back to IK mask.
+        skip_mask = self._last_step_skip_postprocess_mask or self._last_step_ik_mask
         policy_rows = [
             row
             for row in range(batch_size)
-            if row >= len(self._last_step_ik_mask) or not self._last_step_ik_mask[row]
+            if row >= len(skip_mask) or not skip_mask[row]
         ]
         if policy_rows:
             row_index = torch.tensor(policy_rows, dtype=torch.long, device=action.device)
@@ -589,12 +617,29 @@ class ACTSegmentPolicy(ACTPolicy):
         from dataset.core.frame_labels import FrameLabelEnum
 
         batch_size = self._select_action_batchsize
+        if not self._ompl_trackers:
+            self._ompl_trackers = [None] * batch_size
+        elif len(self._ompl_trackers) != batch_size:
+            raise ValueError(
+                f"ompl tracker batch mismatch: {len(self._ompl_trackers)} vs {batch_size}"
+            )
 
+        # Finish completed OMPL plans before refill so chunk_t can advance.
+        for row in range(batch_size):
+            tracker = self._ompl_trackers[row]
+            if tracker is not None and tracker.done:
+                self._ompl_trackers[row] = None
+                self._chunk_t[row] += 1
+
+        # Rows mid-OMPL tracking pause chunk drain; exclude them from refill.
         if self._chunk_actions is None:
             rows_to_refill = list(range(batch_size))
         else:
             rows_to_refill = [
-                row for row in range(batch_size) if self._chunk_t[row] >= self._chunk_horizons[row]
+                row
+                for row in range(batch_size)
+                if self._ompl_trackers[row] is None
+                and self._chunk_t[row] >= self._chunk_horizons[row]
             ]
         if rows_to_refill:
             self._refill_hybrid_rows(batch, rows_to_refill)
@@ -602,41 +647,82 @@ class ACTSegmentPolicy(ACTPolicy):
         assert self._chunk_actions is not None
         assert self._chunk_labels is not None
 
-        batch_size = self._select_action_batchsize
         action_dim = self._chunk_actions.shape[-1]
         device = self._chunk_actions.device
         dtype = self._chunk_actions.dtype
-        dummy = torch.tensor(get_libero_dummy_action(), device=device, dtype=dtype)
+        dummy_vals = self._dummy_action if self._dummy_action is not None else get_libero_dummy_action()
+        dummy = torch.tensor(dummy_vals, device=device, dtype=dtype)
 
         actions_out = torch.empty(batch_size, action_dim, device=device, dtype=dtype)
         ik_targets: list[Any | None] = [None] * batch_size
         ik_mask = [False] * batch_size
+        skip_postprocess = [False] * batch_size
         step_telemetry: list[HybridStepTelemetry | None] = [None] * batch_size
+
+        # Batch Layer-1 planning for rows that newly trigger MP under ompl_waypoints.
+        ompl_plan_requests: list[int] = []
+        if self.config.mp_executor_type == "ompl_waypoints":
+            for row in range(batch_size):
+                if self._ompl_trackers[row] is not None:
+                    continue
+                chunk_t = self._chunk_t[row]
+                if chunk_t >= self._chunk_horizons[row]:
+                    continue
+                target = self._targets_by_frame[row].get(chunk_t)
+                if target is not None and id(target) not in self._executed_target_ids[row]:
+                    ompl_plan_requests.append(row)
+
+            if ompl_plan_requests:
+                self._start_ompl_trackers_for_rows(ompl_plan_requests, batch_size, batch)
 
         for row in range(batch_size):
             chunk_t = self._chunk_t[row]
-            target = self._targets_by_frame[row].get(chunk_t)
+            tracker = self._ompl_trackers[row] # TODO move into ompl_waypoints mode
             label = int(self._chunk_labels[row, chunk_t].item())
             action_source = "none"
+            proccessed_mp_action = False
+            ee_wp: tuple[float, ...] | None = None
+            wp_index: int | None = None
+            plan_done = False
 
-            if target is not None and id(target) not in self._executed_target_ids[row]:
-                if self.config.mp_executor_type == "ik_pose_setter":
-                    # Dummy OSC action for this step; the real MP motion comes from
-                    # ``IkPending`` targets finalized inside :meth:`select_action`.
+            # Deal with OMPL waypoint mode
+            if self.config.mp_executor_type == "ompl_waypoints":
+                if tracker is not None and not tracker.done:
+                    live_ee = self._live_ee_pose_for_row(batch, row)
+                    osc = tracker.step(live_ee)
+                    actions_out[row] = torch.as_tensor(osc, device=device, dtype=dtype)
+                    skip_postprocess[row] = True
+                    action_source = "mp"
+                    ee_wp = tuple(float(x) for x in tracker.current_waypoint.tolist())
+                    wp_index = int(tracker.cursor)
+                    plan_done = bool(tracker.done)
+                    # Pause chunk_t while tracking.
+
+                    proccessed_mp_action = True
+            # Deal with IK pose setter mode
+            elif self.config.mp_executor_type == "ik_pose_setter":
+                target = self._targets_by_frame[row].get(chunk_t)
+                if target is not None and id(target) not in self._executed_target_ids[row]:
+                    # Dummy OSC action; real MP motion via IkPending after env.step.
                     actions_out[row] = dummy
                     ik_targets[row] = target
                     ik_mask[row] = True
+                    skip_postprocess[row] = True
                     action_source = "mp"
                     self._executed_target_ids[row].add(id(target))
-                else:
-                    raise NotImplementedError(
-                        f"mp_executor_type {self.config.mp_executor_type!r} is not supported yet"
-                    )
-            elif FrameLabelEnum.is_l_frame_label(label) or FrameLabelEnum.is_mp_frame_label(label):
+                    self._chunk_t[row] += 1
+
+                    proccessed_mp_action = True
+            else:
+                raise NotImplementedError(
+                    f"mp_executor_type {self.config.mp_executor_type!r} is not supported yet"
+                )
+            
+            # If we haven't processed MP actions, return latest action from policy (presumed L label)
+            if not proccessed_mp_action:
                 actions_out[row] = self._chunk_actions[row, chunk_t]
                 action_source = "policy"
-            else:
-                raise ValueError(f"unknown frame label {label!r} at chunk index {chunk_t}")
+                self._chunk_t[row] += 1
 
             step_telemetry[row] = HybridStepTelemetry(
                 frame_label=label,
@@ -645,13 +731,106 @@ class ACTSegmentPolicy(ACTPolicy):
                 action_source=action_source,
                 is_new_chunk=chunk_t == 0,
                 chunk_anchor_step=int(self._chunk_anchor_steps[row]),
+                ee_waypoint=ee_wp,
+                ompl_waypoint_index=wp_index,
+                ompl_plan_done=plan_done,
             )
-            self._chunk_t[row] += 1
 
         self._ik_pending = IkPending(targets=ik_targets, mask=ik_mask)
         self._last_step_telemetry = step_telemetry
         self._last_step_ik_mask = list(ik_mask)
+        self._last_step_skip_postprocess_mask = list(skip_postprocess)
         return actions_out
+
+    def _live_ee_pose_for_row(self, batch: dict[str, Tensor], row: int) -> np.ndarray:
+        """Read physical 6-D EE pose from complementary batch key ``live_ee_pose``."""
+        if "live_ee_pose" not in batch:
+            raise RuntimeError(
+                "ompl_waypoints requires batch['live_ee_pose'] before select_action "
+                "(physical EE from env-preprocessed observation; preserved by preprocessor)"
+            )
+        poses = batch["live_ee_pose"]
+        if row >= int(poses.shape[0]):
+            raise RuntimeError(
+                f"ompl_waypoints live_ee_pose batch too short: row={row}, size={poses.shape[0]}"
+            )
+        pose = poses[row]
+        if isinstance(pose, torch.Tensor):
+            return pose.detach().cpu().numpy().astype(np.float64).reshape(6)
+        return np.asarray(pose, dtype=np.float64).reshape(6)
+
+    def _start_ompl_trackers_for_rows(
+        self, rows: Sequence[int], batch_size: int, batch: dict[str, Tensor]
+    ) -> None:
+        """Run Layer-1 planning for *rows* and install :class:`WaypointOscTracker`s."""
+        from hybrid_eval.connectors.action_format import gripper_from_action
+        from hybrid_eval.execution.waypoint_osc import (
+            WaypointOscTracker,
+            execution_plan_from_mapping,
+        )
+
+        if self._eval_vector_env is None:
+            raise RuntimeError(
+                "ompl_waypoints requires bind_eval_env(vector_env) before select_action "
+                "(VectorEnv plan_ompl_indexed RPC)"
+            )
+
+        targets: list[Any | None] = [None] * batch_size
+        poses: list[np.ndarray] = [np.zeros(6, dtype=np.float64) for _ in range(batch_size)]
+        mask = [False] * batch_size
+        for row in rows:
+            chunk_t = self._chunk_t[row]
+            target = self._targets_by_frame[row].get(chunk_t)
+            if target is None:
+                continue
+            targets[row] = target
+            poses[row] = self._live_ee_pose_for_row(batch, row)
+            mask[row] = True
+
+        if not any(mask):
+            return
+
+        cfg = self.config
+        plan_results = self._eval_vector_env.call(
+            "plan_ompl_indexed",
+            targets,
+            poses,
+            mask,
+            algorithm=cfg.ompl_algorithm,
+            time_limit=cfg.ompl_time_limit,
+            include_grasped_object_in_validity=cfg.ompl_include_grasped_object_in_validity,
+            on_ik_failure=cfg.ompl_on_ik_failure,
+            max_ee_step_m=cfg.ompl_max_ee_step_m,
+            path_interpolate_count=cfg.ompl_path_interpolate_count,
+            pos_scale=cfg.ompl_pos_scale,
+            rot_scale=cfg.ompl_rot_scale,
+        )
+        # VectorEnv.call returns one result per env (list); Sync may return list of dicts.
+        if not isinstance(plan_results, (list, tuple)):
+            plan_results = [plan_results]
+
+        for row in rows:
+            if row >= len(plan_results):
+                continue
+            mapping = plan_results[row]
+            target = targets[row]
+            if mapping is None or target is None:
+                continue
+            plan = execution_plan_from_mapping(mapping)
+            grip = gripper_from_action(target.action, target.action_format)
+            tracker = WaypointOscTracker(
+                plan=plan,
+                gripper_cmd=0.0 if grip is None else float(grip),
+                pos_tol_m=float(cfg.ompl_pos_tol_m),
+                ori_tol_rad=cfg.ompl_ori_tol_rad,
+                max_steps_per_waypoint=int(cfg.ompl_max_steps_per_waypoint),
+                pos_scale=float(cfg.ompl_pos_scale),
+                rot_scale=float(cfg.ompl_rot_scale),
+                max_pos_delta_m=cfg.ompl_max_pos_delta_m,
+                max_ori_delta_rad=cfg.ompl_max_ori_delta_rad,
+            )
+            self._ompl_trackers[row] = tracker
+            self._executed_target_ids[row].add(id(target))
 
     @torch.no_grad()
     def per_step_val_losses(
