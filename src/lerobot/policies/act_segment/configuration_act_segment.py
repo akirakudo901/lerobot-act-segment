@@ -41,6 +41,8 @@ class ACTSegmentConfig(ACTConfig):
 
     use_hybrid_orchestrator: bool = False
     hybrid_connector: str = "mp_labeled_frames"
+    # ``ik_pose_setter``: dummy action + after-step IK teleport (lerobot_eval hook).
+    # ``ompl_waypoints``: Layer-1 OMPL plan + closed-loop OSC inside select_action.
     mp_executor_type: str = "ik_pose_setter"
     # ``full_chunk``: execute all ``n_action_steps`` before refill.
     # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
@@ -52,6 +54,21 @@ class ACTSegmentConfig(ACTConfig):
     # ``0 .. hybrid_refill_mp_trust_steps - 1`` are executed from the cached chunk;
     # the first MP at index ``>= hybrid_refill_mp_trust_steps`` is deferred.
     hybrid_refill_mp_trust_steps: int = 5
+
+    # OMPL Layer-1 / closed-loop OSC knobs (used when mp_executor_type=ompl_waypoints).
+    ompl_algorithm: str = "RRTConnect"
+    ompl_time_limit: float = 1.0
+    ompl_include_grasped_object_in_validity: bool = False
+    ompl_on_ik_failure: str = "raise"  # raise | skip | best_guess
+    ompl_max_ee_step_m: float = 0.02
+    ompl_path_interpolate_count: int | None = 50
+    ompl_pos_tol_m: float = 0.01
+    ompl_ori_tol_rad: float | None = None
+    ompl_max_steps_per_waypoint: int = 50
+    ompl_max_pos_delta_m: float | None = 0.05
+    ompl_max_ori_delta_rad: float | None = 0.5
+    ompl_pos_scale: float = 0.05
+    ompl_rot_scale: float = 0.5
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
     # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
