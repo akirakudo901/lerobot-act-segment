@@ -119,6 +119,40 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
     if callable(set_processors):
         set_processors(postprocessor)
 
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
+    """Bind VectorEnv into act_segment for Layer-1 OMPL RPC."""
+    cfg = getattr(policy, "config", None)
+    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+        return
+
+    bind = getattr(policy, "bind_eval_env", None)
+    if callable(bind):
+        bind(env)
+
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _attach_live_ee_poses_for_ompl(
+    policy: PreTrainedPolicy,
+    env: gym.vector.VectorEnv,
+    observation: dict[str, Any],
+) -> None:
+    """Attach physical EE poses to the batch for closed-loop OSC (before policy normalize).
+
+    Stored as complementary ``live_ee_pose`` ``(B, 6)`` so the policy preprocessor
+    preserves it and does not treat it as normalized ``observation.state``.
+    """
+    cfg = getattr(policy, "config", None)
+    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+        return
+    hook = _ik_obs_hook_class(env)
+    if hook is None:
+        return
+    mask = [True] * int(env.num_envs)
+    poses = hook.ee_poses_from_observation(observation, mask)
+    observation["live_ee_pose"] = torch.as_tensor(np.stack(poses, axis=0), dtype=torch.float64)
+
 # Hybrid-motion-planner extension (akirakudo901)
 def _policy_handles_rollout_postprocess(policy: PreTrainedPolicy) -> bool:
     return getattr(policy, "_rollout_postprocessor", None) is not None or getattr(
@@ -174,6 +208,8 @@ def rollout(
 
     # Reset the policy and environments.
     policy.reset()
+    # Hybrid-motion-planner extension (akirakudo901): OMPL waypoint mode wiring
+    _configure_ompl_waypoints_rollout(policy, env)
     observation, info = env.reset(seed=seeds)
     if render_callback is not None:
         render_callback(env)
@@ -220,6 +256,10 @@ def rollout(
         observation = env_preprocessor(observation)
         env_preprocessed_obs = observation
 
+        # Hybrid-motion-planner extension (akirakudo901): physical EE for closed-loop OSC
+        # Attach before policy preprocessor so live_ee_pose stays in physical units.
+        _attach_live_ee_poses_for_ompl(policy, env, observation)
+
         observation = preprocessor(observation)
         
         # Hybrid-motion-planner extension (akirakudo901)
@@ -233,7 +273,7 @@ def rollout(
         if not _policy_handles_rollout_postprocess(policy):
             action = postprocessor(action)
 
-        # Hybrid-motion-planner extension (akirakudo901): execute inverse kinematics "jump" for applicable environments
+        # Hybrid-motion-planner extension (akirakudo901): IK teleport only for ik_pose_setter
         consume_ik = getattr(policy, "consume_ik_pending", None)
         ik_pending = consume_ik() if callable(consume_ik) else None
         pre_step_poses: list[np.ndarray] | None = None
