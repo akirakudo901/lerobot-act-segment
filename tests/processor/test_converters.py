@@ -290,6 +290,29 @@ def test_batch_to_transition_with_mp_rescale_key():
     assert roundtrip["mp_rescale_key"] == batch["mp_rescale_key"]
 
 
+# Hybrid-motion-planner extension (akirakudo901)
+def test_batch_to_transition_with_live_ee_pose():
+    """live_ee_pose survives batch <-> transition conversion for OMPL OSC (physical units)."""
+    live_ee = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.0, 0.1, 0.0], [0.4, 0.5, 0.6, 0.0, -0.1, 0.0]],
+        dtype=torch.float64,
+    )
+    batch = {
+        OBS_STATE: torch.randn(2, 8),
+        "live_ee_pose": live_ee,
+    }
+
+    transition = batch_to_transition(batch)
+    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+    assert torch.equal(comp_data["live_ee_pose"], live_ee)
+    # Must not be folded into observation (would risk policy normalization).
+    obs = transition[TransitionKey.OBSERVATION]
+    assert obs is not None and "live_ee_pose" not in obs
+
+    roundtrip = transition_to_batch(transition)
+    assert torch.equal(roundtrip["live_ee_pose"], live_ee)
+
+
 def test_batch_to_transition_without_index_fields():
     """Test that conversion works without index and task_index fields."""
 
