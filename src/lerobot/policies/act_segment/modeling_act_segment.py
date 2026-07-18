@@ -301,8 +301,11 @@ class ACTSegmentPolicy(ACTPolicy):
         action: Tensor,
     ) -> Tensor:
         batch_size = int(action.shape[0])
-        mp_rescaling_keys = self._mp_rescaling_keys_for_batch(batch, batch_size)
         frame_labels = self._frame_labels_for_batch(batch_size)
+        if self._mp_rescaling_ctx is not None:
+            mp_rescaling_keys = self._mp_rescaling_keys_for_batch(batch, batch_size)
+        else:
+            mp_rescaling_keys = [""] * batch_size
         finalized = action.clone()
 
         policy_rows = [
