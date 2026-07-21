@@ -62,7 +62,8 @@ class ACTSegmentConfig(ACTConfig):
     # Skip MuJoCo collision checks in Layer-1 OMPL (pure geometric planning).
     ompl_always_valid: bool = True
     ompl_on_ik_failure: str = "best_guess"  # raise | skip | best_guess
-    ompl_max_ee_step_m: float = None
+    # None: skip EE densification after OMPL (use interpolate_count waypoints only).
+    ompl_max_ee_step_m: float | None = None
     ompl_path_interpolate_count: int | None = None
     ompl_pos_tol_m: float = 0.01
     ompl_ori_tol_rad: float | None = None
@@ -72,7 +73,7 @@ class ACTSegmentConfig(ACTConfig):
     ompl_pos_scale: float = 0.05
     ompl_rot_scale: float = 0.5
     # Extra OSC ticks holding the final waypoint after it is first reached.
-    ompl_goal_hold_frames: int = 3
+    ompl_goal_hold_frames: int = 0
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
     # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:

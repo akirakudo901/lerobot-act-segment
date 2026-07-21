@@ -573,7 +573,7 @@ class LiberoEnv(gym.Env):
         include_grasped_object_in_validity: bool = False,
         always_valid: bool = True,
         on_ik_failure: str = "raise",
-        max_ee_step_m: float = 0.02,
+        max_ee_step_m: float | None = 0.02,
         path_interpolate_count: int | None = 50,
     ) -> dict[str, Any] | None:
         """Worker RPC shim: bind ``self`` as ``replay_env`` for Layer-1 OMPL."""
@@ -603,7 +603,7 @@ class LiberoEnv(gym.Env):
         include_grasped_object_in_validity: bool = False,
         always_valid: bool = True,
         on_ik_failure: str = "raise",
-        max_ee_step_m: float = 0.02,
+        max_ee_step_m: float | None = 0.02,
         path_interpolate_count: int | None = 50,
         pos_scale: float = 0.05,
         rot_scale: float = 0.5,

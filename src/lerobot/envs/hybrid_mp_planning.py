@@ -32,7 +32,7 @@ def plan_ompl(
     include_grasped_object_in_validity: bool = False,
     always_valid: bool = True,
     on_ik_failure: str = "raise",
-    max_ee_step_m: float = 0.02,
+    max_ee_step_m: float | None = 0.02,
     path_interpolate_count: int | None = 50,
 ) -> dict[str, Any] | None:
     """
@@ -40,6 +40,7 @@ def plan_ompl(
 
     Returns ``None`` when planning is skipped (``on_ik_failure='skip'``).
     With ``always_valid=True`` (default), OMPL skips MuJoCo collision checks.
+    ``max_ee_step_m=None`` skips EE densification (see ``execution_plan_from_path``).
     """
     from hybrid_eval.execution.waypoint_osc import execution_plan_to_mapping
     from hybrid_eval.planning.ompl_motion_planner import OmplPathPlanner, OmplPlanSkipped
@@ -50,7 +51,7 @@ def plan_ompl(
         include_grasped_object_in_validity=bool(include_grasped_object_in_validity),
         always_valid=bool(always_valid),
         on_ik_failure=on_ik_failure,  # type: ignore[arg-type]
-        max_ee_step_m=float(max_ee_step_m),
+        max_ee_step_m=None if max_ee_step_m is None else float(max_ee_step_m),
         path_interpolate_count=path_interpolate_count,
         ik_max_iters=1000,
         ik_pos_tol=1e-2,
@@ -82,7 +83,7 @@ def plan_ompl_indexed(
     include_grasped_object_in_validity: bool = False,
     always_valid: bool = True,
     on_ik_failure: str = "raise",
-    max_ee_step_m: float = 0.02,
+    max_ee_step_m: float | None = 0.02,
     path_interpolate_count: int | None = 50,
     pos_scale: float = 0.05,
     rot_scale: float = 0.5,
