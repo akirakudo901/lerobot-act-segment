@@ -283,6 +283,42 @@ class ACTSegmentPolicy(ACTPolicy):
 
         return finalized
 
+    def _finalize_planning_target(
+        self,
+        target: Any,
+        *,
+        mp_rescaling_key: str = "",
+        frame_label: int | None = None,
+    ) -> Any:
+        """Unnormalize (+ optional MP inverse-rescale) a ``PlanningTarget`` action.
+
+        Used by IK pending (after ``select_action``) and OMPL Layer-1 goal resolution
+        (before ``plan_ompl_indexed``) so both paths consume environment-ready actions.
+        """
+        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
+            return target
+
+        from dataclasses import replace
+
+        from hybrid_eval.eval.mp_action_rescaling_rollout import (
+            apply_mp_action_rescaling_to_actions,
+        )
+
+        action_t = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
+        if self._rollout_postprocessor is not None:
+            action_t = self._rollout_postprocessor(action_t)
+        action_np = action_t.squeeze(0).detach().cpu().numpy().astype("float64", copy=False)
+
+        if self._mp_rescaling_ctx is not None:
+            action_np = apply_mp_action_rescaling_to_actions(
+                action_np.reshape(1, -1),
+                [mp_rescaling_key],
+                [frame_label],
+                self._mp_rescaling_ctx,
+            )[0]
+
+        return replace(target, action=action_np)
+
     def _finalize_ik_pending(
         self,
         *,
@@ -294,35 +330,21 @@ class ACTSegmentPolicy(ACTPolicy):
         if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
             return
 
-        from dataclasses import replace
-
-        from hybrid_eval.connectors.planning_target import PlanningTarget
-        from hybrid_eval.eval.mp_action_rescaling_rollout import (
-            apply_mp_action_rescaling_to_actions,
-        )
-
-        finalized_targets: list[PlanningTarget | None] = []
+        finalized_targets: list[Any | None] = []
         for row, target in enumerate(self._ik_pending.targets):
             if target is None or not self._ik_pending.mask[row]:
                 finalized_targets.append(target)
                 continue
 
-            action_t = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
-            if self._rollout_postprocessor is not None:
-                action_t = self._rollout_postprocessor(action_t)
-            action_np = action_t.squeeze(0).detach().cpu().numpy().astype("float64", copy=False)
-
-            if self._mp_rescaling_ctx is not None:
-                label = frame_labels[row] if row < len(frame_labels) else None
-                task = mp_rescaling_keys[row] if row < len(mp_rescaling_keys) else ""
-                action_np = apply_mp_action_rescaling_to_actions(
-                    action_np.reshape(1, -1),
-                    [task],
-                    [label],
-                    self._mp_rescaling_ctx,
-                )[0]
-
-            finalized_targets.append(replace(target, action=action_np))
+            label = frame_labels[row] if row < len(frame_labels) else None
+            task = mp_rescaling_keys[row] if row < len(mp_rescaling_keys) else ""
+            finalized_targets.append(
+                self._finalize_planning_target(
+                    target,
+                    mp_rescaling_key=task,
+                    frame_label=label,
+                )
+            )
 
         self._ik_pending.targets = finalized_targets
 
@@ -603,8 +625,9 @@ class ACTSegmentPolicy(ACTPolicy):
             self._chunk_t[row] = 0
             self._chunk_anchor_steps[row] = self._rollout_step
 
-            # Connector copies policy-output actions into PlanningTarget; unnormalization
-            # and MP inverse rescaling happen in select_action when rollout processors are set.
+            # Connector copies policy-output (normalized) actions into PlanningTarget.
+            # Unnormalization + MP inverse rescaling run later: OMPL at plan start
+            # (``_finalize_planning_target``), IK via ``_finalize_ik_pending``.
             actions_np = actions[i].detach().cpu().numpy()
             labels_np = labels[i].detach().cpu().numpy()
             targets = self._connector.planning_targets(actions_np, labels_np)
@@ -775,15 +798,28 @@ class ACTSegmentPolicy(ACTPolicy):
                 "(VectorEnv plan_ompl_indexed RPC)"
             )
 
+        if self._mp_rescaling_ctx is not None:
+            mp_rescaling_keys = self._mp_rescaling_keys_for_batch(batch, batch_size)
+        else:
+            mp_rescaling_keys = [""] * batch_size
+
         targets: list[Any | None] = [None] * batch_size
         poses: list[np.ndarray] = [np.zeros(6, dtype=np.float64) for _ in range(batch_size)]
         mask = [False] * batch_size
+        assert self._chunk_labels is not None
         for row in rows:
             chunk_t = self._chunk_t[row]
             target = self._targets_by_frame[row].get(chunk_t)
             if target is None:
                 continue
-            targets[row] = target
+            # Same physical-action path as IK: unnormalize (+ MP unrescale) before goal pose.
+            # Keep normalized originals in ``_targets_by_frame`` so plan retries stay idempotent.
+            frame_label = int(self._chunk_labels[row, chunk_t].item())
+            targets[row] = self._finalize_planning_target(
+                target,
+                mp_rescaling_key=mp_rescaling_keys[row],
+                frame_label=frame_label,
+            )
             poses[row] = self._live_ee_pose_for_row(batch, row)
             mask[row] = True
 
@@ -832,7 +868,10 @@ class ACTSegmentPolicy(ACTPolicy):
                 goal_hold_frames=int(cfg.ompl_goal_hold_frames),
             )
             self._ompl_trackers[row] = tracker
-            self._executed_target_ids[row].add(id(target))
+            # Mark the normalized stash entry (not the finalized copy) as executed.
+            stash = self._targets_by_frame[row].get(self._chunk_t[row])
+            if stash is not None:
+                self._executed_target_ids[row].add(id(stash))
 
     @torch.no_grad()
     def per_step_val_losses(
