@@ -799,6 +799,7 @@ class ACTSegmentPolicy(ACTPolicy):
             algorithm=cfg.ompl_algorithm,
             time_limit=cfg.ompl_time_limit,
             include_grasped_object_in_validity=cfg.ompl_include_grasped_object_in_validity,
+            always_valid=cfg.ompl_always_valid,
             on_ik_failure=cfg.ompl_on_ik_failure,
             max_ee_step_m=cfg.ompl_max_ee_step_m,
             path_interpolate_count=cfg.ompl_path_interpolate_count,
@@ -828,6 +829,7 @@ class ACTSegmentPolicy(ACTPolicy):
                 rot_scale=float(cfg.ompl_rot_scale),
                 max_pos_delta_m=cfg.ompl_max_pos_delta_m,
                 max_ori_delta_rad=cfg.ompl_max_ori_delta_rad,
+                goal_hold_frames=int(cfg.ompl_goal_hold_frames),
             )
             self._ompl_trackers[row] = tracker
             self._executed_target_ids[row].add(id(target))

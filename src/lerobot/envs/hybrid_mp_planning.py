@@ -30,6 +30,7 @@ def plan_ompl(
     algorithm: str = "RRTConnect",
     time_limit: float = 1.0,
     include_grasped_object_in_validity: bool = False,
+    always_valid: bool = True,
     on_ik_failure: str = "raise",
     max_ee_step_m: float = 0.02,
     path_interpolate_count: int | None = 50,
@@ -38,6 +39,7 @@ def plan_ompl(
     Layer-1 OMPL plan against *replay_env* → picklable ``ExecutionPlan`` mapping.
 
     Returns ``None`` when planning is skipped (``on_ik_failure='skip'``).
+    With ``always_valid=True`` (default), OMPL skips MuJoCo collision checks.
     """
     from hybrid_eval.execution.waypoint_osc import execution_plan_to_mapping
     from hybrid_eval.planning.ompl_motion_planner import OmplPathPlanner, OmplPlanSkipped
@@ -46,6 +48,7 @@ def plan_ompl(
         algorithm=algorithm,
         time_limit=float(time_limit),
         include_grasped_object_in_validity=bool(include_grasped_object_in_validity),
+        always_valid=bool(always_valid),
         on_ik_failure=on_ik_failure,  # type: ignore[arg-type]
         max_ee_step_m=float(max_ee_step_m),
         path_interpolate_count=path_interpolate_count,
@@ -77,6 +80,7 @@ def plan_ompl_indexed(
     algorithm: str = "RRTConnect",
     time_limit: float = 1.0,
     include_grasped_object_in_validity: bool = False,
+    always_valid: bool = True,
     on_ik_failure: str = "raise",
     max_ee_step_m: float = 0.02,
     path_interpolate_count: int | None = 50,
@@ -110,6 +114,7 @@ def plan_ompl_indexed(
         algorithm=algorithm,
         time_limit=time_limit,
         include_grasped_object_in_validity=include_grasped_object_in_validity,
+        always_valid=always_valid,
         on_ik_failure=on_ik_failure,
         max_ee_step_m=max_ee_step_m,
         path_interpolate_count=path_interpolate_count,

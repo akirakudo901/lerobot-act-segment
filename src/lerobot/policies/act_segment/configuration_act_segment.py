@@ -59,9 +59,11 @@ class ACTSegmentConfig(ACTConfig):
     ompl_algorithm: str = "RRTConnect"
     ompl_time_limit: float = 1.0
     ompl_include_grasped_object_in_validity: bool = False
-    ompl_on_ik_failure: str = "raise"  # raise | skip | best_guess
-    ompl_max_ee_step_m: float = 0.02
-    ompl_path_interpolate_count: int | None = 50
+    # Skip MuJoCo collision checks in Layer-1 OMPL (pure geometric planning).
+    ompl_always_valid: bool = True
+    ompl_on_ik_failure: str = "best_guess"  # raise | skip | best_guess
+    ompl_max_ee_step_m: float = None
+    ompl_path_interpolate_count: int | None = None
     ompl_pos_tol_m: float = 0.01
     ompl_ori_tol_rad: float | None = None
     ompl_max_steps_per_waypoint: int = 50
@@ -69,6 +71,8 @@ class ACTSegmentConfig(ACTConfig):
     ompl_max_ori_delta_rad: float | None = 0.5
     ompl_pos_scale: float = 0.05
     ompl_rot_scale: float = 0.5
+    # Extra OSC ticks holding the final waypoint after it is first reached.
+    ompl_goal_hold_frames: int = 3
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
     # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
