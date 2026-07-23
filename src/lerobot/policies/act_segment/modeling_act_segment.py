@@ -75,6 +75,9 @@ class HybridStepTelemetry:
     ompl_plan_failed: bool = False
     ompl_retry_index: int | None = None
     ompl_failure_status: str | None = None
+    ompl_failure_message: str | None = None
+    ompl_failure_attempts: int | None = None
+    ompl_failure_detail: dict[str, Any] | None = None
     ompl_plan_exhausted: bool = False
 
 
@@ -713,17 +716,34 @@ class ACTSegmentPolicy(ACTPolicy):
         status: str,
         failure: dict[str, Any] | None,
     ) -> None:
+        import logging
+
+        from hybrid_eval.planning.ompl_motion_planner import OmplSoftPlanFailure
+
         attempts = int(self._ompl_plan_retries[row]) + 1
+        soft = OmplSoftPlanFailure.from_mapping(
+            failure,
+            attempts=attempts,
+            default_status=status,
+        )
         message = (
             f"OMPL plan retries exhausted for env row={row} after {attempts} attempt(s); "
-            f"last_status={status!r}"
+            f"last_status={soft.status!r}\n{soft.message}"
         )
-        if failure and failure.get("message"):
-            message = f"{message}\n{failure['message']}"
+        # Persist a structured record (status/message/attempts + raw planner payload).
+        recorded = {
+            **dict(soft.detail),
+            "ok": False,
+            "status": soft.status,
+            "message": soft.message,
+            "attempts": attempts,
+            "row": int(row),
+        }
         on_exhausted = str(self.config.ompl_plan_on_exhausted).strip().lower()
         if on_exhausted == "terminate_hold":
             self._ompl_plan_exhausted[row] = True
-            self._ompl_last_failure[row] = failure
+            self._ompl_last_failure[row] = recorded
+            logging.getLogger(__name__).warning(message)
             return
         if on_exhausted != "raise":
             raise ValueError(
@@ -733,9 +753,9 @@ class ACTSegmentPolicy(ACTPolicy):
         raise OmplPlanRetriesExhausted(
             message,
             row=row,
-            status=status,
+            status=soft.status,
             attempts=attempts,
-            last_failure=failure,
+            last_failure=recorded,
         )
 
     def _plan_ompl_rows_with_retries(
@@ -890,10 +910,22 @@ class ACTSegmentPolicy(ACTPolicy):
                 int(self._ompl_plan_retries[row]) if self._ompl_plan_retries[row] > 0 else None
             )
             failure_status = None
+            failure_message = None
+            failure_attempts = None
+            failure_detail = None
             if self._ompl_last_failure[row] is not None:
                 from lerobot.envs.hybrid_mp_planning import ompl_plan_failure_status
 
-                failure_status = ompl_plan_failure_status(self._ompl_last_failure[row])
+                failure = self._ompl_last_failure[row]
+                failure_status = ompl_plan_failure_status(failure)
+                failure_message = (
+                    None if failure is None else str(failure.get("message") or failure_status)
+                )
+                if failure is not None and failure.get("attempts") is not None:
+                    failure_attempts = int(failure["attempts"])
+                elif plan_exhausted:
+                    failure_attempts = int(self._ompl_plan_retries[row]) + 1
+                failure_detail = None if failure is None else dict(failure)
 
             # Deal with OMPL waypoint mode
             if self.config.mp_executor_type == "ompl_waypoints":
@@ -964,6 +996,9 @@ class ACTSegmentPolicy(ACTPolicy):
                 ompl_plan_failed=plan_failed,
                 ompl_retry_index=retry_index,
                 ompl_failure_status=failure_status,
+                ompl_failure_message=failure_message,
+                ompl_failure_attempts=failure_attempts,
+                ompl_failure_detail=failure_detail,
                 ompl_plan_exhausted=plan_exhausted,
             )
 

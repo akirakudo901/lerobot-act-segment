@@ -320,6 +320,11 @@ def rollout(
                         is_new_chunk=telemetry.is_new_chunk,
                         chunk_anchor_step=telemetry.chunk_anchor_step,
                         chunk_output=chunk_output,
+                        ompl_plan_exhausted=bool(getattr(telemetry, "ompl_plan_exhausted", False)),
+                        ompl_failure_status=getattr(telemetry, "ompl_failure_status", None),
+                        ompl_failure_message=getattr(telemetry, "ompl_failure_message", None),
+                        ompl_failure_attempts=getattr(telemetry, "ompl_failure_attempts", None),
+                        ompl_failure_detail=getattr(telemetry, "ompl_failure_detail", None),
                     )
 
         # Apply the next action.
@@ -584,6 +589,22 @@ def eval_policy(
                     show_predicted_span_overlays=False,
                     x_label="episode step",
                 )
+                if getattr(segment_result, "planning_failure", None) is not None:
+                    import json
+
+                    failure = segment_result.planning_failure
+                    failure_path = video_path.with_name(
+                        f"{video_path.stem}_ompl_plan_failure.json"
+                    )
+                    payload = (
+                        failure.to_mapping()
+                        if hasattr(failure, "to_mapping")
+                        else {
+                            "status": getattr(failure, "status", "failed"),
+                            "message": str(failure),
+                        }
+                    )
+                    failure_path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
                 video_paths.append(str(video_path))
                 live_recorder.reset_episode(env_ix)
                 n_episodes_rendered += 1
