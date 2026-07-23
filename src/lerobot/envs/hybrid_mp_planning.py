@@ -12,14 +12,62 @@ planner construction in each env class.
 
 Worker envs (AsyncVectorEnv) still need thin methods that call these helpers —
 ``VectorEnv.call`` can only invoke methods that exist on the worker env instance.
+
+Plan results are picklable dicts:
+- success: ``ExecutionPlan`` mapping (has ``joint_waypoints`` / ``ee_waypoints``)
+- skip: ``None`` (``on_ik_failure='skip'``)
+- failure: ``{"ok": False, "status": ..., "message": ..., ...}`` so AsyncVectorEnv
+  workers do not die on ``OmplPlanFailed``
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
+
+
+def is_ompl_plan_failure(result: Any) -> bool:
+    """True when *result* is a soft OMPL failure payload from :func:`plan_ompl`."""
+    return isinstance(result, Mapping) and result.get("ok") is False
+
+
+def is_ompl_plan_success(result: Any) -> bool:
+    """True when *result* is a serialised :class:`ExecutionPlan` mapping."""
+    if not isinstance(result, Mapping):
+        return False
+    if result.get("ok") is False:
+        return False
+    return "joint_waypoints" in result and "ee_waypoints" in result
+
+
+def ompl_plan_failure_status(result: Any) -> str:
+    """Best-effort status string for a soft failure / skip result."""
+    if result is None:
+        return "skipped"
+    if is_ompl_plan_failure(result):
+        return str(result.get("status") or "failed")
+    return "unknown"
+
+
+def _ompl_plan_failed_to_mapping(err: Any) -> dict[str, Any]:
+    """Picklable soft-failure payload from :class:`OmplPlanFailed`."""
+    return {
+        "ok": False,
+        "status": str(getattr(err, "status", "failed")),
+        "message": str(err),
+        "ik_success": bool(getattr(err, "ik_success", False)),
+        "ik_pos_err": float(getattr(err, "ik_pos_err", float("nan"))),
+        "ik_ori_err": float(getattr(err, "ik_ori_err", float("nan"))),
+        "algorithm": getattr(err, "algorithm", None),
+        "time_limit": getattr(err, "time_limit", None),
+        "goal_ee_pose": (
+            None
+            if getattr(err, "goal_ee_pose", None) is None
+            else np.asarray(err.goal_ee_pose, dtype=np.float64).reshape(6)
+        ),
+    }
 
 
 def plan_ompl(
@@ -39,11 +87,16 @@ def plan_ompl(
     Layer-1 OMPL plan against *replay_env* → picklable ``ExecutionPlan`` mapping.
 
     Returns ``None`` when planning is skipped (``on_ik_failure='skip'``).
+    Returns a soft-failure dict (``ok=False``) when OMPL finds no path.
     With ``always_valid=True`` (default), OMPL skips MuJoCo collision checks.
     ``max_ee_step_m=None`` skips EE densification (see ``execution_plan_from_path``).
     """
     from hybrid_eval.execution.waypoint_osc import execution_plan_to_mapping
-    from hybrid_eval.planning.ompl_motion_planner import OmplPathPlanner, OmplPlanSkipped
+    from hybrid_eval.planning.ompl_motion_planner import (
+        OmplPlanFailed,
+        OmplPathPlanner,
+        OmplPlanSkipped,
+    )
 
     planner = OmplPathPlanner(
         algorithm=algorithm,
@@ -68,6 +121,8 @@ def plan_ompl(
         )
     except OmplPlanSkipped:
         return None
+    except OmplPlanFailed as err:
+        return _ompl_plan_failed_to_mapping(err)
     return execution_plan_to_mapping(plan)
 
 

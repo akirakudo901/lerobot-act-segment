@@ -74,6 +74,16 @@ class ACTSegmentConfig(ACTConfig):
     ompl_rot_scale: float = 0.5
     # Extra OSC ticks holding the final waypoint after it is first reached.
     ompl_goal_hold_frames: int = 0
+    # After a Layer-1 plan failure, requery the policy this many times before giving up.
+    # Total plan attempts = 1 + ompl_plan_max_retries (initial + requeries).
+    ompl_plan_max_retries: int = 3
+    # On requery refill, sample ACT latent from N(0, I) instead of the deterministic zero vector.
+    ompl_retry_sample_latent: bool = True
+    # Multiply ``ompl_time_limit`` on retries whose previous status looks like a planner timeout.
+    ompl_retry_time_limit_scale: float = 2.0
+    # ``raise``: abort select_action with OmplPlanRetriesExhausted.
+    # ``terminate_hold``: emit dummy OSC and mark the row exhausted (no chunk advance).
+    ompl_plan_on_exhausted: str = "raise"
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
     # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
