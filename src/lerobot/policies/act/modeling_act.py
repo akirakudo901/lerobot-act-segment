@@ -393,7 +393,10 @@ class ACT(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(
-        self, batch: dict[str, Tensor], sample_encoded_dist: bool = False
+        self,
+        batch: dict[str, Tensor],
+        sample_encoded_dist: bool = False,
+        sample_latent_prior: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
@@ -413,19 +416,25 @@ class ACT(nn.Module):
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
         """
-        actions, vae_params, _decoder_out = self._forward_from_batch(batch, sample_encoded_dist)
+        actions, vae_params, _decoder_out = self._forward_from_batch(
+            batch, sample_encoded_dist, sample_latent_prior=sample_latent_prior
+        )
         return actions, vae_params
 
     def _forward_from_batch(
-        self, 
+        self,
         batch: dict[str, Tensor],
-        sample_encoded_dist: bool = False
+        sample_encoded_dist: bool = False,
+        sample_latent_prior: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Tensor]:
         """
         Run ACT and also return decoder token features for auxiliary heads.
         
         If `sample_encoded_dist` is true, decoder input is sampled from the encoder
         latent output instead of the mean, with mu and log_sigma_x2 returned.
+
+        If `sample_latent_prior` is true at inference (no action teacher), sample the
+        encoder latent from ``N(0, I)`` instead of the deterministic zero vector.
         """
         sample_encoded_dist = sample_encoded_dist or self.training
         if self.config.use_vae and sample_encoded_dist:
@@ -482,12 +491,18 @@ class ACT(nn.Module):
             # Sample the latent with the reparameterization trick.
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
         else:
-            # When not using the VAE encoder, we set the latent to be all zeros.
+            # Inference (no action teacher): zero latent by default; optional N(0, I) for diverse retries.
             mu = log_sigma_x2 = None
-            # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
-            )
+            device = batch[OBS_STATE].device
+            if sample_latent_prior:
+                latent_sample = torch.randn(
+                    batch_size, self.config.latent_dim, dtype=torch.float32, device=device
+                )
+            else:
+                # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
+                latent_sample = torch.zeros(
+                    [batch_size, self.config.latent_dim], dtype=torch.float32
+                ).to(device)
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
