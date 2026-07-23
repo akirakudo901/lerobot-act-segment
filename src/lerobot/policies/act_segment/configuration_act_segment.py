@@ -59,8 +59,8 @@ class ACTSegmentConfig(ACTConfig):
     ompl_algorithm: str = "RRTConnect"
     ompl_time_limit: float = 1.0
     ompl_include_grasped_object_in_validity: bool = False
-    # Skip MuJoCo collision checks in Layer-1 OMPL (pure geometric planning).
-    ompl_always_valid: bool = True
+    # False: MuJoCo collision checks in Layer-1 OMPL. True: pure geometric planning.
+    ompl_always_valid: bool = False
     ompl_on_ik_failure: str = "best_guess"  # raise | skip | best_guess
     # None: skip EE densification after OMPL (use interpolate_count waypoints only).
     ompl_max_ee_step_m: float | None = None
@@ -81,9 +81,9 @@ class ACTSegmentConfig(ACTConfig):
     ompl_retry_sample_latent: bool = True
     # Multiply ``ompl_time_limit`` on retries whose previous status looks like a planner timeout.
     ompl_retry_time_limit_scale: float = 2.0
-    # ``raise``: abort select_action with OmplPlanRetriesExhausted.
     # ``terminate_hold``: emit dummy OSC and mark the row exhausted (no chunk advance).
-    ompl_plan_on_exhausted: str = "raise"
+    # ``raise``: abort select_action with OmplPlanRetriesExhausted.
+    ompl_plan_on_exhausted: str = "terminate_hold"
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
     # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:

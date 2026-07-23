@@ -78,7 +78,7 @@ def plan_ompl(
     algorithm: str = "RRTConnect",
     time_limit: float = 1.0,
     include_grasped_object_in_validity: bool = False,
-    always_valid: bool = True,
+    always_valid: bool = False,
     on_ik_failure: str = "raise",
     max_ee_step_m: float | None = 0.02,
     path_interpolate_count: int | None = 50,
@@ -88,7 +88,8 @@ def plan_ompl(
 
     Returns ``None`` when planning is skipped (``on_ik_failure='skip'``).
     Returns a soft-failure dict (``ok=False``) when OMPL finds no path.
-    With ``always_valid=True`` (default), OMPL skips MuJoCo collision checks.
+    With ``always_valid=False`` (default), OMPL uses MuJoCo collision checks;
+    set ``always_valid=True`` for pure geometric planning.
     ``max_ee_step_m=None`` skips EE densification (see ``execution_plan_from_path``).
     """
     from hybrid_eval.execution.waypoint_osc import execution_plan_to_mapping
@@ -136,7 +137,7 @@ def plan_ompl_indexed(
     algorithm: str = "RRTConnect",
     time_limit: float = 1.0,
     include_grasped_object_in_validity: bool = False,
-    always_valid: bool = True,
+    always_valid: bool = False,
     on_ik_failure: str = "raise",
     max_ee_step_m: float | None = 0.02,
     path_interpolate_count: int | None = 50,
