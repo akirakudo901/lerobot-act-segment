@@ -44,7 +44,14 @@ class ACTSegmentConfig(ACTConfig):
     mp_executor_type: str = "ik_pose_setter"
     # ``full_chunk``: execute all ``n_action_steps`` before refill.
     # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
+    # ``trust_near_mp``: like ``until_first_mp`` when the first MP frame lies within the
+    # first ``hybrid_refill_mp_trust_steps`` predicted actions; otherwise stop before that
+    # MP frame (exclusive) and refill so MP is re-predicted from live observations.
     hybrid_refill_mode: str = "full_chunk"
+    # Only used when ``hybrid_refill_mode`` is ``trust_near_mp``. MP frames at indices
+    # ``0 .. hybrid_refill_mp_trust_steps - 1`` are executed from the cached chunk;
+    # the first MP at index ``>= hybrid_refill_mp_trust_steps`` is deferred.
+    hybrid_refill_mp_trust_steps: int = 5
 
     # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
     # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
