@@ -926,6 +926,16 @@ class ACTSegmentPolicy(ACTPolicy):
                 elif plan_exhausted:
                     failure_attempts = int(self._ompl_plan_retries[row]) + 1
                 failure_detail = None if failure is None else dict(failure)
+                # PNG stills are only needed once for the live recorder; drop them from
+                # the cached failure so later exhaust-hold steps stay lightweight.
+                if (
+                    plan_exhausted
+                    and isinstance(self._ompl_last_failure[row], dict)
+                    and "failure_stills" in self._ompl_last_failure[row]
+                ):
+                    cached = dict(self._ompl_last_failure[row])
+                    cached.pop("failure_stills", None)
+                    self._ompl_last_failure[row] = cached
 
             # Deal with OMPL waypoint mode
             if self.config.mp_executor_type == "ompl_waypoints":

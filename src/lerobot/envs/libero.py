@@ -218,6 +218,8 @@ class LiberoEnv(gym.Env):
             else self.episode_length
         )
         self.control_mode = control_mode
+        # When True, Layer-1 OMPL soft failures capture blob/ghost PNG stills in-worker.
+        self._ompl_failure_viz_enabled = False
         images = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
@@ -385,6 +387,11 @@ class LiberoEnv(gym.Env):
             raise ValueError(f"Invalid control mode: {self.control_mode}")
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False}
+        # Re-inject / re-bind after reset in case the underlying model was reloaded.
+        if self._ompl_failure_viz_enabled:
+            from lerobot.envs.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
+
+            enable_viz(self)
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
@@ -627,6 +634,13 @@ class LiberoEnv(gym.Env):
             pos_scale=pos_scale,
             rot_scale=rot_scale,
         )
+
+    def enable_ompl_failure_viz(self) -> None:
+        """Inject mocap ghost / goal-marker bodies for OMPL failure stills (worker RPC)."""
+        from lerobot.envs.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
+
+        self._ensure_env()
+        enable_viz(self)
 
     def close(self):
         if self._env is not None:

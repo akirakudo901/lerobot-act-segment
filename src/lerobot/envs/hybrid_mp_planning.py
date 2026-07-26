@@ -17,7 +17,8 @@ Plan results are picklable dicts:
 - success: ``ExecutionPlan`` mapping (has ``joint_waypoints`` / ``ee_waypoints``)
 - skip: ``None`` (``on_ik_failure='skip'``)
 - failure: ``{"ok": False, "status": ..., "message": ..., ...}`` so AsyncVectorEnv
-  workers do not die on ``OmplPlanFailed``
+  workers do not die on ``OmplPlanFailed``. When failure-viz is enabled on the
+  worker env, soft failures also include picklable PNG ``failure_stills``.
 """
 
 from __future__ import annotations
@@ -51,8 +52,39 @@ def ompl_plan_failure_status(result: Any) -> str:
     return "unknown"
 
 
+def _qpos_diagnosis_to_mapping(diagnosis: Any | None) -> dict[str, Any] | None:
+    if diagnosis is None:
+        return None
+    return {
+        "reason": diagnosis.reason_label(),
+        "in_bounds": bool(diagnosis.in_bounds),
+        "collision_valid": bool(diagnosis.collision_valid),
+        "joint_limit_violations": [
+            {
+                "joint_index": int(v.joint_index),
+                "value": float(v.value),
+                "lower": float(v.lower),
+                "upper": float(v.upper),
+            }
+            for v in getattr(diagnosis, "joint_limit_violations", ())
+        ],
+        "offending_contacts": [
+            {
+                "geom1_name": str(c.geom1_name),
+                "geom2_name": str(c.geom2_name),
+                "dist": float(c.dist),
+            }
+            for c in getattr(diagnosis, "offending_contacts", ())
+        ],
+    }
+
+
 def _ompl_plan_failed_to_mapping(err: Any) -> dict[str, Any]:
     """Picklable soft-failure payload from :class:`OmplPlanFailed`."""
+    goal = getattr(err, "goal_ee_pose", None)
+    gripper = getattr(err, "gripper_qpos", None)
+    q_start = getattr(err, "q_start", None)
+    q_goal = getattr(err, "q_goal", None)
     return {
         "ok": False,
         "status": str(getattr(err, "status", "failed")),
@@ -63,11 +95,34 @@ def _ompl_plan_failed_to_mapping(err: Any) -> dict[str, Any]:
         "algorithm": getattr(err, "algorithm", None),
         "time_limit": getattr(err, "time_limit", None),
         "goal_ee_pose": (
-            None
-            if getattr(err, "goal_ee_pose", None) is None
-            else np.asarray(err.goal_ee_pose, dtype=np.float64).reshape(6)
+            None if goal is None else np.asarray(goal, dtype=np.float64).reshape(6)
+        ),
+        "gripper_qpos": (
+            None if gripper is None else np.asarray(gripper, dtype=np.float64).reshape(-1)
+        ),
+        "q_start": (
+            None if q_start is None else np.asarray(q_start, dtype=np.float64).reshape(-1)
+        ),
+        "q_goal": (
+            None if q_goal is None else np.asarray(q_goal, dtype=np.float64).reshape(-1)
+        ),
+        "diagnosis": _qpos_diagnosis_to_mapping(getattr(err, "diagnosis", None)),
+        "start_diagnosis": _qpos_diagnosis_to_mapping(
+            getattr(err, "start_diagnosis", None)
         ),
     }
+
+
+def enable_ompl_failure_viz(replay_env: Any) -> None:
+    """Inject mocap ghost / goal-marker bodies and mark *replay_env* for still capture."""
+    from hybrid_eval.visualize.ompl_failure_render import ensure_ompl_failure_viz
+
+    ensure_ompl_failure_viz(replay_env)
+    replay_env._ompl_failure_viz_enabled = True
+
+
+def is_ompl_failure_viz_enabled(replay_env: Any) -> bool:
+    return bool(getattr(replay_env, "_ompl_failure_viz_enabled", False))
 
 
 def plan_ompl(
@@ -91,6 +146,9 @@ def plan_ompl(
     With ``always_valid=False`` (default), OMPL uses MuJoCo collision checks;
     set ``always_valid=True`` for pure geometric planning.
     ``max_ee_step_m=None`` skips EE densification (see ``execution_plan_from_path``).
+
+    When :func:`enable_ompl_failure_viz` has been called on *replay_env*, soft
+    failures include ``failure_stills`` PNG bytes captured at the failure frame.
     """
     from hybrid_eval.execution.waypoint_osc import execution_plan_to_mapping
     from hybrid_eval.planning.ompl_motion_planner import (
@@ -98,6 +156,7 @@ def plan_ompl(
         OmplPathPlanner,
         OmplPlanSkipped,
     )
+    from hybrid_eval.visualize.ompl_failure_render import attach_ompl_failure_stills
 
     planner = OmplPathPlanner(
         algorithm=algorithm,
@@ -123,7 +182,10 @@ def plan_ompl(
     except OmplPlanSkipped:
         return None
     except OmplPlanFailed as err:
-        return _ompl_plan_failed_to_mapping(err)
+        mapping = _ompl_plan_failed_to_mapping(err)
+        if is_ompl_failure_viz_enabled(replay_env):
+            attach_ompl_failure_stills(replay_env, mapping)
+        return mapping
     return execution_plan_to_mapping(plan)
 
 

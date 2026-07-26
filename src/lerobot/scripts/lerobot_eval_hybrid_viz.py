@@ -23,6 +23,9 @@ Uses the same metrics and rollout loop as :mod:`lerobot.scripts.lerobot_eval`, b
 MP4s with agentview + wrist cameras and predicted-label / chunk-boundary overlays from
 ``hybrid_eval.visualize`` instead of the default third-person-only render.
 
+When ``policy.mp_executor_type=ompl_waypoints``, workers inject mocap ghost / goal-marker
+bodies and soft OMPL failures dump blob + ghost PNGs beside the hybrid videos.
+
 Ground-truth labels and actions are omitted when unavailable (live sim eval).
 """
 

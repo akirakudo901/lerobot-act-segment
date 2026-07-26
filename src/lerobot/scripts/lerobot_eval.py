@@ -122,7 +122,7 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
 
 # Hybrid-motion-planner extension (akirakudo901)
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
-    """Bind VectorEnv into act_segment for Layer-1 OMPL RPC."""
+    """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills."""
     cfg = getattr(policy, "config", None)
     if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
         return
@@ -130,6 +130,72 @@ def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.
     bind = getattr(policy, "bind_eval_env", None)
     if callable(bind):
         bind(env)
+
+    # Inject mocap ghost / goal-marker in each worker so soft plan failures can
+    # attach picklable PNG stills (see hybrid_mp_planning.plan_ompl).
+    try:
+        env.call("enable_ompl_failure_viz")
+    except (AttributeError, NotImplementedError, TypeError):
+        pass
+
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _write_ompl_plan_failure_artifacts(failure: Any, video_path: Path) -> list[Path]:
+    """Write OMPL failure JSON (+ PNG stills when present) next to a hybrid eval video."""
+    from hybrid_eval.visualize.ompl_failure_render import (
+        FAILURE_STILLS_KEY,
+        write_ompl_failure_stills_from_mapping,
+    )
+
+    failure_path = video_path.with_name(f"{video_path.stem}_ompl_plan_failure.json")
+    payload = (
+        failure.to_mapping()
+        if hasattr(failure, "to_mapping")
+        else {
+            "status": getattr(failure, "status", "failed"),
+            "message": str(failure),
+        }
+    )
+    if not isinstance(payload, dict):
+        payload = {"payload": payload}
+
+    # Prefer stills nested under detail (OmplSoftPlanFailure) or top-level.
+    stills_src: dict[str, Any] = dict(payload)
+    detail = payload.get("detail")
+    if isinstance(detail, dict) and FAILURE_STILLS_KEY in detail:
+        stills_src = detail
+
+    written = write_ompl_failure_stills_from_mapping(
+        stills_src,
+        video_path.parent,
+        stem_prefix=video_path.stem,
+    )
+
+    # Drop raw PNG bytes before JSON dump; record paths instead.
+    cleaned = dict(payload)
+    detail_clean = cleaned.get("detail")
+    if isinstance(detail_clean, dict) and FAILURE_STILLS_KEY in detail_clean:
+        detail_clean = dict(detail_clean)
+        detail_clean.pop(FAILURE_STILLS_KEY, None)
+        if written:
+            detail_clean["failure_still_paths"] = {k: str(v) for k, v in written.items()}
+        cleaned["detail"] = detail_clean
+    elif FAILURE_STILLS_KEY in cleaned:
+        cleaned = dict(cleaned)
+        cleaned.pop(FAILURE_STILLS_KEY, None)
+        if written:
+            cleaned["failure_still_paths"] = {k: str(v) for k, v in written.items()}
+
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.floating, np.integer)):
+            return obj.item()
+        return str(obj)
+
+    failure_path.write_text(json.dumps(cleaned, indent=2, default=_json_default) + "\n")
+    return [failure_path, *written.values()]
+
 
 
 # Hybrid-motion-planner extension (akirakudo901)
@@ -590,21 +656,10 @@ def eval_policy(
                     x_label="episode step",
                 )
                 if getattr(segment_result, "planning_failure", None) is not None:
-                    import json
-
-                    failure = segment_result.planning_failure
-                    failure_path = video_path.with_name(
-                        f"{video_path.stem}_ompl_plan_failure.json"
+                    _write_ompl_plan_failure_artifacts(
+                        segment_result.planning_failure,
+                        video_path,
                     )
-                    payload = (
-                        failure.to_mapping()
-                        if hasattr(failure, "to_mapping")
-                        else {
-                            "status": getattr(failure, "status", "failed"),
-                            "message": str(failure),
-                        }
-                    )
-                    failure_path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
                 video_paths.append(str(video_path))
                 live_recorder.reset_episode(env_ix)
                 n_episodes_rendered += 1
