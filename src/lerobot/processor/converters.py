@@ -160,6 +160,8 @@ _COMPLEMENTARY_KEYS = (
     "task",
     # Hybrid-motion-planner extension (akirakudo901)
     "mp_rescale_key",
+    # Hybrid-motion-planner extension (akirakudo901)
+    "live_ee_pose",  # physical EE (B, 6); must not be normalized with observation.state
     "index",
     "task_index",
     "episode_index",

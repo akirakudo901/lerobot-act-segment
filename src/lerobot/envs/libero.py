@@ -218,6 +218,8 @@ class LiberoEnv(gym.Env):
             else self.episode_length
         )
         self.control_mode = control_mode
+        # When True, Layer-1 OMPL soft failures capture blob/ghost PNG stills in-worker.
+        self._ompl_failure_viz_enabled = False
         images = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
@@ -385,6 +387,11 @@ class LiberoEnv(gym.Env):
             raise ValueError(f"Invalid control mode: {self.control_mode}")
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False}
+        # Re-inject / re-bind after reset in case the underlying model was reloaded.
+        if self._ompl_failure_viz_enabled:
+            from lerobot.envs.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
+
+            enable_viz(self)
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
@@ -562,6 +569,78 @@ class LiberoEnv(gym.Env):
         if not mask[idx] or targets[idx] is None:
             return
         self.execute_ik(targets[idx], np.asarray(poses[idx], dtype=np.float64))
+
+    def plan_ompl(
+        self,
+        start_ee_pose: np.ndarray,
+        goal_ee_pose: np.ndarray,
+        *,
+        algorithm: str = "RRTConnect",
+        time_limit: float = 1.0,
+        include_grasped_object_in_validity: bool = False,
+        always_valid: bool = False,
+        on_ik_failure: str = "raise",
+        max_ee_step_m: float | None = 0.02,
+        path_interpolate_count: int | None = 50,
+    ) -> dict[str, Any] | None:
+        """Worker RPC shim: bind ``self`` as ``replay_env`` for Layer-1 OMPL."""
+        from lerobot.envs.hybrid_mp_planning import plan_ompl as plan_ompl_on_env
+
+        return plan_ompl_on_env(
+            self,
+            start_ee_pose,
+            goal_ee_pose,
+            algorithm=algorithm,
+            time_limit=time_limit,
+            include_grasped_object_in_validity=include_grasped_object_in_validity,
+            always_valid=always_valid,
+            on_ik_failure=on_ik_failure,
+            max_ee_step_m=max_ee_step_m,
+            path_interpolate_count=path_interpolate_count,
+        )
+
+    def plan_ompl_indexed(
+        self,
+        targets: Sequence[Any | None],
+        poses: Sequence[np.ndarray],
+        mask: Sequence[bool],
+        *,
+        algorithm: str = "RRTConnect",
+        time_limit: float = 1.0,
+        include_grasped_object_in_validity: bool = False,
+        always_valid: bool = False,
+        on_ik_failure: str = "raise",
+        max_ee_step_m: float | None = 0.02,
+        path_interpolate_count: int | None = 50,
+        pos_scale: float = 0.05,
+        rot_scale: float = 0.5,
+    ) -> dict[str, Any] | None:
+        """Worker RPC shim for batched ``VectorEnv.call('plan_ompl_indexed', ...)``."""
+        from lerobot.envs.hybrid_mp_planning import plan_ompl_indexed as plan_ompl_indexed_on_env
+
+        return plan_ompl_indexed_on_env(
+            self,
+            self.episode_index,
+            targets,
+            poses,
+            mask,
+            algorithm=algorithm,
+            time_limit=time_limit,
+            include_grasped_object_in_validity=include_grasped_object_in_validity,
+            always_valid=always_valid,
+            on_ik_failure=on_ik_failure,
+            max_ee_step_m=max_ee_step_m,
+            path_interpolate_count=path_interpolate_count,
+            pos_scale=pos_scale,
+            rot_scale=rot_scale,
+        )
+
+    def enable_ompl_failure_viz(self) -> None:
+        """Inject mocap ghost / goal-marker bodies for OMPL failure stills (worker RPC)."""
+        from lerobot.envs.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
+
+        self._ensure_env()
+        enable_viz(self)
 
     def close(self):
         if self._env is not None:

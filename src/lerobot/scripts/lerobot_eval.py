@@ -119,6 +119,106 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
     if callable(set_processors):
         set_processors(postprocessor)
 
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
+    """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills."""
+    cfg = getattr(policy, "config", None)
+    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+        return
+
+    bind = getattr(policy, "bind_eval_env", None)
+    if callable(bind):
+        bind(env)
+
+    # Inject mocap ghost / goal-marker in each worker so soft plan failures can
+    # attach picklable PNG stills (see hybrid_mp_planning.plan_ompl).
+    try:
+        env.call("enable_ompl_failure_viz")
+    except (AttributeError, NotImplementedError, TypeError):
+        pass
+
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _write_ompl_plan_failure_artifacts(failure: Any, video_path: Path) -> list[Path]:
+    """Write OMPL failure JSON (+ PNG stills when present) next to a hybrid eval video."""
+    from hybrid_eval.visualize.ompl_failure_render import (
+        FAILURE_STILLS_KEY,
+        write_ompl_failure_stills_from_mapping,
+    )
+
+    failure_path = video_path.with_name(f"{video_path.stem}_ompl_plan_failure.json")
+    payload = (
+        failure.to_mapping()
+        if hasattr(failure, "to_mapping")
+        else {
+            "status": getattr(failure, "status", "failed"),
+            "message": str(failure),
+        }
+    )
+    if not isinstance(payload, dict):
+        payload = {"payload": payload}
+
+    # Prefer stills nested under detail (OmplSoftPlanFailure) or top-level.
+    stills_src: dict[str, Any] = dict(payload)
+    detail = payload.get("detail")
+    if isinstance(detail, dict) and FAILURE_STILLS_KEY in detail:
+        stills_src = detail
+
+    written = write_ompl_failure_stills_from_mapping(
+        stills_src,
+        video_path.parent,
+        stem_prefix=video_path.stem,
+    )
+
+    # Drop raw PNG bytes before JSON dump; record paths instead.
+    cleaned = dict(payload)
+    detail_clean = cleaned.get("detail")
+    if isinstance(detail_clean, dict) and FAILURE_STILLS_KEY in detail_clean:
+        detail_clean = dict(detail_clean)
+        detail_clean.pop(FAILURE_STILLS_KEY, None)
+        if written:
+            detail_clean["failure_still_paths"] = {k: str(v) for k, v in written.items()}
+        cleaned["detail"] = detail_clean
+    elif FAILURE_STILLS_KEY in cleaned:
+        cleaned = dict(cleaned)
+        cleaned.pop(FAILURE_STILLS_KEY, None)
+        if written:
+            cleaned["failure_still_paths"] = {k: str(v) for k, v in written.items()}
+
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.floating, np.integer)):
+            return obj.item()
+        return str(obj)
+
+    failure_path.write_text(json.dumps(cleaned, indent=2, default=_json_default) + "\n")
+    return [failure_path, *written.values()]
+
+
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _attach_live_ee_poses_for_ompl(
+    policy: PreTrainedPolicy,
+    env: gym.vector.VectorEnv,
+    observation: dict[str, Any],
+) -> None:
+    """Attach physical EE poses to the batch for closed-loop OSC (before policy normalize).
+
+    Stored as complementary ``live_ee_pose`` ``(B, 6)`` so the policy preprocessor
+    preserves it and does not treat it as normalized ``observation.state``.
+    """
+    cfg = getattr(policy, "config", None)
+    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+        return
+    hook = _ik_obs_hook_class(env)
+    if hook is None:
+        return
+    mask = [True] * int(env.num_envs)
+    poses = hook.ee_poses_from_observation(observation, mask)
+    observation["live_ee_pose"] = torch.as_tensor(np.stack(poses, axis=0), dtype=torch.float64)
+
 # Hybrid-motion-planner extension (akirakudo901)
 def _policy_handles_rollout_postprocess(policy: PreTrainedPolicy) -> bool:
     return getattr(policy, "_rollout_postprocessor", None) is not None or getattr(
@@ -174,6 +274,8 @@ def rollout(
 
     # Reset the policy and environments.
     policy.reset()
+    # Hybrid-motion-planner extension (akirakudo901): OMPL waypoint mode wiring
+    _configure_ompl_waypoints_rollout(policy, env)
     observation, info = env.reset(seed=seeds)
     if render_callback is not None:
         render_callback(env)
@@ -220,6 +322,10 @@ def rollout(
         observation = env_preprocessor(observation)
         env_preprocessed_obs = observation
 
+        # Hybrid-motion-planner extension (akirakudo901): physical EE for closed-loop OSC
+        # Attach before policy preprocessor so live_ee_pose stays in physical units.
+        _attach_live_ee_poses_for_ompl(policy, env, observation)
+
         observation = preprocessor(observation)
         
         # Hybrid-motion-planner extension (akirakudo901)
@@ -233,7 +339,7 @@ def rollout(
         if not _policy_handles_rollout_postprocess(policy):
             action = postprocessor(action)
 
-        # Hybrid-motion-planner extension (akirakudo901): execute inverse kinematics "jump" for applicable environments
+        # Hybrid-motion-planner extension (akirakudo901): IK teleport only for ik_pose_setter
         consume_ik = getattr(policy, "consume_ik_pending", None)
         ik_pending = consume_ik() if callable(consume_ik) else None
         pre_step_poses: list[np.ndarray] | None = None
@@ -280,6 +386,11 @@ def rollout(
                         is_new_chunk=telemetry.is_new_chunk,
                         chunk_anchor_step=telemetry.chunk_anchor_step,
                         chunk_output=chunk_output,
+                        ompl_plan_exhausted=bool(getattr(telemetry, "ompl_plan_exhausted", False)),
+                        ompl_failure_status=getattr(telemetry, "ompl_failure_status", None),
+                        ompl_failure_message=getattr(telemetry, "ompl_failure_message", None),
+                        ompl_failure_attempts=getattr(telemetry, "ompl_failure_attempts", None),
+                        ompl_failure_detail=getattr(telemetry, "ompl_failure_detail", None),
                     )
 
         # Apply the next action.
@@ -544,6 +655,11 @@ def eval_policy(
                     show_predicted_span_overlays=False,
                     x_label="episode step",
                 )
+                if getattr(segment_result, "planning_failure", None) is not None:
+                    _write_ompl_plan_failure_artifacts(
+                        segment_result.planning_failure,
+                        video_path,
+                    )
                 video_paths.append(str(video_path))
                 live_recorder.reset_episode(env_ix)
                 n_episodes_rendered += 1
