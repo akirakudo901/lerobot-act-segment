@@ -316,6 +316,7 @@ def rollout(
                 observation["task"] = [""] * env.num_envs
         
         # Hybrid-motion-planner extension (akirakudo901): populate mp-rescaling keys for hybrid rollouts
+        # TODO In the future, make task_suite/stem the canonical key
         observation["mp_rescale_key"] = list(env.call("task"))
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
