@@ -13,6 +13,10 @@ For each checkpoint, runs :mod:`lerobot.scripts.lerobot_eval_hybrid_viz` and log
 aggregated metrics from ``eval_info.json`` to a WandB run (typically the original
 training run, resumed by ``--wandb-run-id``).
 
+Metrics are logged under ``eval_fixed/`` by default (configurable via
+``--wandb-metric-prefix``) so re-evals do not overwrite the training-time
+``eval/*`` series / videos when those were produced by broken code.
+
 Usage
 -----
 ::
@@ -106,6 +110,25 @@ def discover_checkpoints(
     return checkpoints
 
 
+def _aggregate_episode_metrics(values: dict) -> dict[str, float | int]:
+    """Build overall-style scalars from per-episode lists (list-shaped per_task)."""
+    aggregated: dict[str, float | int] = {}
+    successes = values.get("successes")
+    sum_rewards = values.get("sum_rewards")
+    max_rewards = values.get("max_rewards")
+
+    if isinstance(successes, list) and successes:
+        aggregated["pc_success"] = float(sum(bool(s) for s in successes) / len(successes) * 100)
+        aggregated["n_episodes"] = len(successes)
+    if isinstance(sum_rewards, list) and sum_rewards:
+        aggregated["avg_sum_reward"] = float(sum(sum_rewards) / len(sum_rewards))
+        aggregated.setdefault("n_episodes", len(sum_rewards))
+    if isinstance(max_rewards, list) and max_rewards:
+        aggregated["avg_max_reward"] = float(sum(max_rewards) / len(max_rewards))
+        aggregated.setdefault("n_episodes", len(max_rewards))
+    return aggregated
+
+
 def flatten_eval_metrics(eval_info: dict) -> dict[str, float | int]:
     """Flatten eval_info.json into scalar metrics suitable for WandB logging."""
     metrics: dict[str, float | int] = {}
@@ -116,22 +139,36 @@ def flatten_eval_metrics(eval_info: dict) -> dict[str, float | int]:
             if isinstance(value, (int, float)) and not (isinstance(value, float) and math.isnan(value)):
                 metrics[f"{prefix}{key}"] = value
 
-    # overall = eval_info.get("overall")
-    # if isinstance(overall, dict):
-    #     _add("", overall)
+    overall = eval_info.get("overall")
+    if isinstance(overall, dict):
+        _add("", overall)
 
-    # per_group = eval_info.get("per_group")
-    # if isinstance(per_group, dict):
-    #     for group_name, group_values in per_group.items():
-    #         if isinstance(group_values, dict):
-    #             _add(f"{group_name}/", group_values)
+    per_group = eval_info.get("per_group")
+    if isinstance(per_group, dict):
+        for group_name, group_values in per_group.items():
+            if isinstance(group_values, dict):
+                safe_group = str(group_name).replace("/", "_")
+                _add(f"group/{safe_group}/", group_values)
 
     per_task = eval_info.get("per_task")
     if isinstance(per_task, dict):
         for task_name, task_values in per_task.items():
             if isinstance(task_values, dict):
-                safe_task = task_name.replace("/", "_")
+                safe_task = str(task_name).replace("/", "_")
                 _add(f"task/{safe_task}/", task_values)
+    elif isinstance(per_task, list):
+        # lerobot_eval multi-task schema: list[{task_group, task_id, metrics:{...lists...}}]
+        for item in per_task:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("metrics", item)
+            if not isinstance(raw, dict):
+                continue
+            task_values = raw if "pc_success" in raw else {**raw, **_aggregate_episode_metrics(raw)}
+            task_group = item.get("task_group", "task")
+            task_id = item.get("task_id", "unknown")
+            safe_task = f"{task_group}_{task_id}".replace("/", "_")
+            _add(f"task/{safe_task}/", task_values)
 
     return metrics
 
@@ -167,11 +204,22 @@ def log_eval_to_wandb(
     checkpoint_path: Path,
     video_fps: int | None,
     log_video: bool,
+    metric_prefix: str = "eval_fixed",
 ) -> None:
+    """Log checkpoint eval scalars/videos under ``metric_prefix`` (default ``eval_fixed``).
+
+    Uses a distinct prefix from training-time ``eval/*`` so corrected re-evals can
+    coexist on the same resumed WandB run without fighting old media/history.
+    """
+    prefix = metric_prefix.strip().strip("/")
+    if not prefix:
+        raise ValueError("metric_prefix must be a non-empty WandB key prefix")
+
     metrics = flatten_eval_metrics(eval_info)
-    wandb_metrics = {f"eval/{key}": value for key, value in metrics.items()}
-    wandb_metrics["eval/checkpoint_step"] = step
-    wandb_metrics["eval/checkpoint_path"] = str(checkpoint_path)
+    wandb_metrics = {f"{prefix}/{key}": value for key, value in metrics.items()}
+    wandb_metrics[f"{prefix}/checkpoint_step"] = step
+    wandb_metrics[f"{prefix}/checkpoint_path"] = str(checkpoint_path)
+    # Align x-axis with training steps when overlaying on the same run.
     wandb_module.log(wandb_metrics, step=step)
 
     if not log_video:
@@ -189,7 +237,7 @@ def log_eval_to_wandb(
         return
 
     wandb_module.log(
-        {"eval/video": wandb_module.Video(video_path, fps=video_fps, format="mp4")},
+        {f"{prefix}/video": wandb_module.Video(video_path, fps=video_fps, format="mp4")},
         step=step,
     )
 
@@ -247,6 +295,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional WandB run notes.",
+    )
+    parser.add_argument(
+        "--wandb-metric-prefix",
+        type=str,
+        default="eval_fixed",
+        help=(
+            "WandB key prefix for re-eval metrics/videos (default: eval_fixed). "
+            "Distinct from training-time eval/* so corrected results coexist on the same run."
+        ),
     )
     parser.add_argument(
         "--min-step",
@@ -347,6 +404,13 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["WANDB_SILENT"] = "True"
     import wandb
 
+    metric_prefix = args.wandb_metric_prefix.strip().strip("/")
+    if not metric_prefix:
+        logging.error("--wandb-metric-prefix must be non-empty")
+        return 1
+
+    # "allow" resumes the training run when it exists (online or after sync), and
+    # still creates an offline local run with that id when the server is unreachable.
     wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
@@ -354,14 +418,17 @@ def main(argv: list[str] | None = None) -> int:
         name=args.wandb_run_name,
         notes=args.wandb_notes,
         job_type="eval",
-        resume="must" if args.wandb_run_id else None,
+        resume="allow" if args.wandb_run_id else None,
         mode=args.wandb_mode,
         dir=str(args.output_dir),
         config={
             "checkpoints_dir": str(checkpoints_dir),
             "eval_extra_args": eval_extra_args,
+            "wandb_metric_prefix": metric_prefix,
         },
     )
+    # Group re-eval metrics under the chosen prefix for cleaner WandB panels.
+    wandb.define_metric(f"{metric_prefix}/*")
 
     summary: list[dict] = []
     failures: list[dict] = []
@@ -390,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
                     checkpoint_path=checkpoint.pretrained_path,
                     video_fps=args.video_fps,
                     log_video=args.log_video,
+                    metric_prefix=metric_prefix,
                 )
                 overall = eval_info.get("overall", {})
                 summary.append(
@@ -400,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
                         "avg_sum_reward": overall.get("avg_sum_reward"),
                         "n_episodes": overall.get("n_episodes"),
                         "eval_info_path": str(eval_info_path),
+                        "wandb_metric_prefix": metric_prefix,
                     }
                 )
             except Exception as exc:
