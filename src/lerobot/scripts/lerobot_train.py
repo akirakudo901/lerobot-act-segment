@@ -685,8 +685,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
         if cfg.env and is_eval_step:
             if is_main_process:
+                from lerobot.policies.act_segment.configuration_act_segment import ACTSegmentConfig
+
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+                # Save all eval rollout videos under output_dir/eval/; WandB still gets
+                # only the first one below. Segment policies use hybrid-viz rendering
+                # (same as lerobot-eval-hybrid-viz) instead of plain third-person MP4s.
+                eval_videos_dir = cfg.output_dir / "eval" / f"videos_step_{step_id}"
+                use_hybrid_viz = isinstance(cfg.policy, ACTSegmentConfig)
+                eval_video_kwargs: dict[str, Any] = (
+                    {"hybrid_videos_dir": eval_videos_dir}
+                    if use_hybrid_viz
+                    else {"videos_dir": eval_videos_dir}
+                )
+                if use_hybrid_viz:
+                    logging.info(
+                        "Using hybrid-viz eval videos for segment policy (%s)",
+                        cfg.policy.type,
+                    )
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
@@ -696,10 +713,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
+                        max_episodes_rendered=10,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        **eval_video_kwargs,
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
@@ -728,7 +745,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    video_paths = eval_info["overall"].get("video_paths") or []
+                    if video_paths:
+                        # Keep WandB upload to the first video only; all episodes are
+                        # still written under eval_videos_dir above.
+                        wandb_logger.log_video(video_paths[0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 
