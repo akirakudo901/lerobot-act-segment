@@ -510,20 +510,24 @@ class ACTSegmentPolicy(ACTPolicy):
         num_valid = mask.sum() * abs_err.shape[-1]
         return (abs_err * mask).sum() / num_valid.clamp_min(1)
 
-    def _mp_l_action_masks(self, batch: dict[str, Tensor], action_valid_mask: Tensor) -> tuple[Tensor, Tensor]:
-        """MP mask = MP-labeled valid steps; L mask = L-labeled valid steps."""
+    def _masked_ce_mean(self, per_step_ce: Tensor, mask: Tensor) -> Tensor:
+        """Mean CE over masked steps; empty mask contributes 0."""
+        return (per_step_ce * mask).sum() / mask.sum().clamp_min(1)
+
+    def _mp_l_label_masks(self, batch: dict[str, Tensor], label_valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+        """MP/L masks over valid label steps (ground-truth frame type)."""
         from dataset.core.frame_labels import FrameLabelEnum
-        import numpy as np
 
         labels = self._label_targets(batch)
-        label_valid_mask = self._label_valid_mask(batch)
-        step_valid = action_valid_mask.squeeze(-1) & label_valid_mask
-
         mp_mask = FrameLabelEnum.is_mp_frame_label_array(labels)
         l_mask = FrameLabelEnum.is_l_frame_label_array(labels)
-        mp_step = step_valid & mp_mask
-        l_step = step_valid & l_mask
+        return label_valid_mask & mp_mask, label_valid_mask & l_mask
 
+    def _mp_l_action_masks(self, batch: dict[str, Tensor], action_valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+        """MP mask = MP-labeled valid steps; L mask = L-labeled valid steps."""
+        label_valid_mask = self._label_valid_mask(batch)
+        step_valid = action_valid_mask.squeeze(-1) & label_valid_mask
+        mp_step, l_step = self._mp_l_label_masks(batch, step_valid)
         return mp_step.unsqueeze(-1), l_step.unsqueeze(-1)
 
     @torch.no_grad()
@@ -1222,9 +1226,14 @@ class ACTSegmentPolicy(ACTPolicy):
             label_targets.reshape(-1),
             reduction="none",
         ).view(labels_logits.shape[0], labels_logits.shape[1])
-        num_valid_labels = label_valid_mask.sum().clamp_min(1)
-        label_ce_loss = (per_step_ce * label_valid_mask).sum() / num_valid_labels
+        mp_label_mask, l_label_mask = self._mp_l_label_masks(batch, label_valid_mask)
+        mp_ce_loss = self._masked_ce_mean(per_step_ce, mp_label_mask)
+        l_ce_loss = self._masked_ce_mean(per_step_ce, l_label_mask)
+        weighted_label_ce_loss = (
+            self.config.mp_ce_weight * mp_ce_loss + self.config.l_ce_weight * l_ce_loss
+        )
 
+        num_valid_labels = label_valid_mask.sum().clamp_min(1)
         preds = labels_logits.argmax(dim=-1)
         label_accuracy = ((preds == label_targets) & label_valid_mask).sum().float() / num_valid_labels
 
@@ -1232,7 +1241,9 @@ class ACTSegmentPolicy(ACTPolicy):
             "mp_l1_loss": mp_l1_loss.item(),
             "l_l1_loss": l_l1_loss.item(),
             "weighted_l1_loss": weighted_l1_loss.item(),
-            "label_ce_loss": label_ce_loss.item(),
+            "mp_ce_loss": mp_ce_loss.item(),
+            "l_ce_loss": l_ce_loss.item(),
+            "weighted_label_ce_loss": weighted_label_ce_loss.item(),
             "label_accuracy": label_accuracy.item(),
         }
 
@@ -1241,12 +1252,8 @@ class ACTSegmentPolicy(ACTPolicy):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = (
-                weighted_l1_loss
-                + mean_kld * self.config.kl_weight
-                + label_ce_loss * self.config.label_weight
-            )
+            loss = weighted_l1_loss + mean_kld * self.config.kl_weight + weighted_label_ce_loss
         else:
-            loss = weighted_l1_loss + label_ce_loss * self.config.label_weight
+            loss = weighted_l1_loss + weighted_label_ce_loss
 
         return loss, loss_dict
