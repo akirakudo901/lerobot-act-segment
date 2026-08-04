@@ -651,6 +651,7 @@ def eval_policy(
                     segment_result,
                     video_path,
                     video_fps=fps,
+                    camera_scale=1,
                     show_ground_truth=False,
                     show_gt_segment_span=False,
                     show_predicted_span_overlays=False,
