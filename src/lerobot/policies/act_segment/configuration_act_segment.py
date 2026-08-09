@@ -67,6 +67,12 @@ class ACTSegmentConfig(ACTConfig):
     # None: skip EE densification after OMPL (use interpolate_count waypoints only).
     ompl_max_ee_step_m: float | None = None
     ompl_path_interpolate_count: int | None = None
+    # Fraction of joint-space extent between discrete collision samples (OMPL).
+    ompl_validity_checking_resolution: float = 0.03
+    # Shortcut the OMPL solution path after solve (can hug obstacles more tightly).
+    ompl_simplify: bool = True
+    # MuJoCo contact.dist below this (m) counts as collision. None = planner default.
+    ompl_contact_dist_eps: float | None = None
     ompl_pos_tol_m: float = 0.01
     ompl_ori_tol_rad: float | None = None
     ompl_max_steps_per_waypoint: int = 50

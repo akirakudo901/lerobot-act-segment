@@ -1118,6 +1118,9 @@ class ACTSegmentPolicy(ACTPolicy):
             on_ik_failure=cfg.ompl_on_ik_failure,
             max_ee_step_m=cfg.ompl_max_ee_step_m,
             path_interpolate_count=cfg.ompl_path_interpolate_count,
+            validity_checking_resolution=cfg.ompl_validity_checking_resolution,
+            simplify=cfg.ompl_simplify,
+            contact_dist_eps=cfg.ompl_contact_dist_eps,
             pos_scale=cfg.ompl_pos_scale,
             rot_scale=cfg.ompl_rot_scale,
         )

@@ -137,6 +137,9 @@ def plan_ompl(
     on_ik_failure: str = "raise",
     max_ee_step_m: float | None = 0.02,
     path_interpolate_count: int | None = 50,
+    validity_checking_resolution: float = 0.03,
+    simplify: bool = True,
+    contact_dist_eps: float | None = None,
 ) -> dict[str, Any] | None:
     """
     Layer-1 OMPL plan against *replay_env* → picklable ``ExecutionPlan`` mapping.
@@ -166,6 +169,11 @@ def plan_ompl(
         on_ik_failure=on_ik_failure,  # type: ignore[arg-type]
         max_ee_step_m=None if max_ee_step_m is None else float(max_ee_step_m),
         path_interpolate_count=path_interpolate_count,
+        validity_checking_resolution=float(validity_checking_resolution),
+        simplify=bool(simplify),
+        contact_dist_eps=(
+            None if contact_dist_eps is None else float(contact_dist_eps)
+        ),
         ik_max_iters=1000,
         ik_pos_tol=1e-2,
         ik_ori_tol=3e-2,
@@ -203,6 +211,9 @@ def plan_ompl_indexed(
     on_ik_failure: str = "raise",
     max_ee_step_m: float | None = 0.02,
     path_interpolate_count: int | None = 50,
+    validity_checking_resolution: float = 0.03,
+    simplify: bool = True,
+    contact_dist_eps: float | None = None,
     pos_scale: float = 0.05,
     rot_scale: float = 0.5,
 ) -> dict[str, Any] | None:
@@ -237,4 +248,7 @@ def plan_ompl_indexed(
         on_ik_failure=on_ik_failure,
         max_ee_step_m=max_ee_step_m,
         path_interpolate_count=path_interpolate_count,
+        validity_checking_resolution=validity_checking_resolution,
+        simplify=simplify,
+        contact_dist_eps=contact_dist_eps,
     )

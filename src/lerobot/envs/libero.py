@@ -582,6 +582,9 @@ class LiberoEnv(gym.Env):
         on_ik_failure: str = "raise",
         max_ee_step_m: float | None = 0.02,
         path_interpolate_count: int | None = 50,
+        validity_checking_resolution: float = 0.03,
+        simplify: bool = True,
+        contact_dist_eps: float | None = None,
     ) -> dict[str, Any] | None:
         """Worker RPC shim: bind ``self`` as ``replay_env`` for Layer-1 OMPL."""
         from lerobot.envs.hybrid_mp_planning import plan_ompl as plan_ompl_on_env
@@ -597,6 +600,9 @@ class LiberoEnv(gym.Env):
             on_ik_failure=on_ik_failure,
             max_ee_step_m=max_ee_step_m,
             path_interpolate_count=path_interpolate_count,
+            validity_checking_resolution=validity_checking_resolution,
+            simplify=simplify,
+            contact_dist_eps=contact_dist_eps,
         )
 
     def plan_ompl_indexed(
@@ -612,6 +618,9 @@ class LiberoEnv(gym.Env):
         on_ik_failure: str = "raise",
         max_ee_step_m: float | None = 0.02,
         path_interpolate_count: int | None = 50,
+        validity_checking_resolution: float = 0.03,
+        simplify: bool = True,
+        contact_dist_eps: float | None = None,
         pos_scale: float = 0.05,
         rot_scale: float = 0.5,
     ) -> dict[str, Any] | None:
@@ -631,6 +640,9 @@ class LiberoEnv(gym.Env):
             on_ik_failure=on_ik_failure,
             max_ee_step_m=max_ee_step_m,
             path_interpolate_count=path_interpolate_count,
+            validity_checking_resolution=validity_checking_resolution,
+            simplify=simplify,
+            contact_dist_eps=contact_dist_eps,
             pos_scale=pos_scale,
             rot_scale=rot_scale,
         )
