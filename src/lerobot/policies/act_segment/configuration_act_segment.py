@@ -48,6 +48,13 @@ class ACTSegmentConfig(ACTConfig):
     mp_executor_type: str = "ik_pose_setter"
     # ``full_chunk``: execute all ``n_action_steps`` before refill.
     # ``until_first_mp``: truncate at first MP-labeled step (inclusive), then refill.
+    # ``until_first_mp_segment``: execute the first contiguous MP run (all consecutive
+    # MP frames, ignoring intermediate ``B-MP`` waypoint boundaries), then refill at the
+    # following L (that L is not executed from the cached chunk). Leading L before the
+    # run is kept. If the run reaches the chunk end with no following L, execute it fully.
+    # ``trust_contiguous_mp``: like ``until_first_mp_segment``, but only trust/execute the
+    # contiguous MP run when an L follows it in the chunk (proof the full run was
+    # predicted). If the run is truncated at the chunk end, stop before it and refill.
     # ``trust_near_mp``: like ``until_first_mp`` when the first MP frame lies within the
     # first ``hybrid_refill_mp_trust_steps`` predicted actions; otherwise stop before that
     # MP frame (exclusive) and refill so MP is re-predicted from live observations.

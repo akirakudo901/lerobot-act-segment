@@ -593,10 +593,38 @@ class ACTSegmentPolicy(ACTPolicy):
                 return t
         return None
 
+    def _first_contiguous_mp_run(self, labels_row: Tensor) -> tuple[int, int] | None:
+        """Half-open ``[start, end)`` of the first contiguous MP run, or None if no MP.
+
+        Contiguity ignores intermediate ``B-MP`` waypoint boundaries; only an L frame
+        (or the end of the label row) ends the run.
+        """
+        from dataset.core.segments import contiguous_mp_runs, iter_labeled_spans
+
+        runs = contiguous_mp_runs(iter_labeled_spans(labels_row.detach().cpu().numpy()))
+        if not runs:
+            return None
+        start = int(runs[0][0][0])
+        end = int(runs[0][-1][1])
+        return start, end
+
     def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
         mode = self.config.hybrid_refill_mode
         if mode == "full_chunk":
             return self.config.n_action_steps
+
+        if mode in ("until_first_mp_segment", "trust_contiguous_mp"):
+            run = self._first_contiguous_mp_run(labels_row)
+            if run is None:
+                return self.config.n_action_steps
+            start, end = run
+            followed_by_l = end < int(labels_row.shape[0])
+            if mode == "until_first_mp_segment":
+                return end
+            # trust_contiguous_mp: only commit when an L proves the run is complete.
+            if followed_by_l:
+                return end
+            return start
 
         first_mp = self._first_mp_frame_index(labels_row)
         if first_mp is None:
@@ -613,7 +641,8 @@ class ACTSegmentPolicy(ACTPolicy):
 
         raise ValueError(
             f"Unknown hybrid_refill_mode {mode!r}; expected "
-            "'full_chunk', 'until_first_mp', or 'trust_near_mp'"
+            "'full_chunk', 'until_first_mp', 'until_first_mp_segment', "
+            "'trust_contiguous_mp', or 'trust_near_mp'"
         )
 
     def _refill_hybrid_rows(
