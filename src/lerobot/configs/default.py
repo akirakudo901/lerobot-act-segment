@@ -48,6 +48,9 @@ class DatasetConfig:
     rescale_mp_actions: bool = True
     mp_rescaling_strategy: str | None = None
     mp_rescaling_min_samples: int = 5
+    # Last-L suffix augmentation (query-conditional MP→L fallback on trailing waypoint spans).
+    enable_last_l_augmentation: bool = False
+    last_l_n: int = 0
 
     def __post_init__(self) -> None:
         if self.episodes is not None:
@@ -63,6 +66,8 @@ class DatasetConfig:
                 f"mp_shift_max must be >= 0 when augmentation-ready transforms are enabled, "
                 f"got {self.mp_shift_max}"
             )
+        if self.last_l_n < 0:
+            raise ValueError(f"last_l_n must be >= 0, got {self.last_l_n}")
 
 
 @dataclass

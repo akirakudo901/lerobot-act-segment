@@ -65,16 +65,21 @@ def _maybe_wrap_mp_aug_ready_dataset(
 
     dataset_root = Path(dataset.root) if dataset.root is not None else None
     logging.info(
-        "Wrapping augmentation-ready dataset at %s (mp_shift_max=%d, augment=%s)",
+        "Wrapping augmentation-ready dataset at %s "
+        "(mp_shift_max=%d, augment=%s, last_l=%s n=%d)",
         dataset_root,
         dataset_cfg.mp_shift_max,
         enable_augmentation,
+        dataset_cfg.enable_last_l_augmentation,
+        dataset_cfg.last_l_n,
     )
     return wrap_mp_aug_ready_dataset(
         dataset,
         chunk_size=int(chunk_size),
         mp_shift_max=int(dataset_cfg.mp_shift_max),
         enable_augmentation=enable_augmentation,
+        enable_last_l_augmentation=bool(dataset_cfg.enable_last_l_augmentation),
+        last_l_n=int(dataset_cfg.last_l_n),
         rescale_mp_actions=dataset_cfg.rescale_mp_actions,
         rescaling_strategy=dataset_cfg.mp_rescaling_strategy,
         min_rescale_samples=dataset_cfg.mp_rescaling_min_samples,
