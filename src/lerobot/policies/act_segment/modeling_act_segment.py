@@ -308,6 +308,7 @@ class ACTSegmentPolicy(ACTPolicy):
         device = finalized.device
         if self._rollout_postprocessor is not None:
             finalized = self._rollout_postprocessor(finalized)
+            finalized = finalized.to(device=device)
 
         if self._mp_rescaling_ctx is not None:
             from hybrid_eval.eval.mp_action_rescaling_rollout import (
