@@ -22,99 +22,42 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import Any, Sequence
 
-import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from lerobot.envs.libero import get_libero_dummy_action
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 from ..act.modeling_act import ACT, ACTPolicy, ACTTemporalEnsembler
 from ..pretrained import PreTrainedPolicy
+from ..segment.losses import (
+    label_targets,
+    label_valid_mask,
+    masked_action_loss_mean,
+    mp_l_action_masks,
+    segment_label_ce,
+)
+from ..segment import rollout_wrapper as _segment_rollout_mod
+from ..segment.rollout_wrapper import (
+    HybridChunkTelemetry,
+    HybridStepTelemetry,
+    IkPending,
+    OmplPlanRetriesExhausted,
+    SegmentRolloutWrapper,
+)
 from .configuration_act_segment import ACTSegmentConfig
 
-if TYPE_CHECKING:
-    from dataset.core.mp_action_rescaling import MpActionRescalingRolloutContext
-    from hybrid_eval.connectors.planning_target import PlanningTarget
-    from hybrid_eval.protocols import MpSegmentConnector
-
-_UNSET_MP_RESCALING_CTX = object()
-
-
-@dataclass
-class IkPending:
-    """Batched IK targets stashed during ``select_action`` for the rollout hook.
-
-    Each ``PlanningTarget.action`` is in environment-ready space when
-    :meth:`ACTSegmentPolicy.set_rollout_action_processors` has been configured
-    (unnormalized and MP-inverse-rescaled when applicable).
-    """
-
-    targets: list[PlanningTarget | None]
-    mask: list[bool]
-
-
-@dataclass(frozen=True)
-class HybridStepTelemetry:
-    """Per-env hybrid routing metadata from the last ``select_action`` call."""
-
-    frame_label: int
-    frame_label_str: str
-    output_frame_index: int
-    action_source: str
-    is_new_chunk: bool
-    chunk_anchor_step: int
-    ee_waypoint: tuple[float, ...] | None = None
-    ompl_waypoint_index: int | None = None
-    ompl_plan_done: bool = False
-    ompl_plan_failed: bool = False
-    ompl_retry_index: int | None = None
-    ompl_failure_status: str | None = None
-    ompl_failure_message: str | None = None
-    ompl_failure_attempts: int | None = None
-    ompl_failure_detail: dict[str, Any] | None = None
-    ompl_plan_exhausted: bool = False
-
-
-class OmplPlanRetriesExhausted(RuntimeError):
-    """Raised when Layer-1 OMPL planning keeps failing after policy requeries."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        row: int,
-        status: str,
-        attempts: int,
-        last_failure: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.row = int(row)
-        self.status = str(status)
-        self.attempts = int(attempts)
-        self.last_failure = last_failure
-
-
-def _ompl_status_is_invalid_start(status: str) -> bool:
-    return "invalid start" in str(status).lower()
-
-
-def _ompl_status_is_timeout(status: str) -> bool:
-    return "timeout" in str(status).lower()
-
-
-@dataclass(frozen=True)
-class HybridChunkTelemetry:
-    """Completed policy chunk metadata for live-eval visualization."""
-
-    row: int
-    anchor_step: int
-    orchestrator_output: Any
+# Re-export hybrid telemetry types for callers that import from this module.
+__all__ = [
+    "ACTSegment",
+    "ACTSegmentPolicy",
+    "HybridChunkTelemetry",
+    "HybridStepTelemetry",
+    "IkPending",
+    "OmplPlanRetriesExhausted",
+]
 
 
 class ACTSegment(ACT):
@@ -154,53 +97,41 @@ class ACTSegmentPolicy(ACTPolicy):
                 "use_hybrid_orchestrator is incompatible with temporal_ensemble_coeff"
             )
 
-        if config.hybrid_refill_mode == "trust_near_mp" and config.hybrid_refill_mp_trust_steps < 0:
-            raise ValueError(
-                "hybrid_refill_mp_trust_steps must be >= 0 when hybrid_refill_mode is 'trust_near_mp'"
-            )
-
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
-        self._connector: MpSegmentConnector | None = None
-        if config.use_hybrid_orchestrator:
-            self._connector = self._make_hybrid_connector()
-
         dataset_meta = kwargs.get("dataset_meta")
         dataset_root = getattr(dataset_meta, "root", None) if dataset_meta is not None else None
-        self._rollout_postprocessor: Any | None = None
-        self._mp_rescaling_ctx: MpActionRescalingRolloutContext | None = self._init_mp_rescaling_context(
+        self._segment_rollout = SegmentRolloutWrapper(
+            self,
+            config,
             dataset_root=dataset_root,
+            pretrained_path=config.pretrained_path,
         )
         self.reset()
 
-    def _make_hybrid_connector(self) -> MpSegmentConnector:
-        from hybrid_eval.connectors import MpLabeledFramesConnector, SegmentEndpointsConnector
+    def __getattr__(self, name: str) -> Any:
+        """Forward hybrid orchestrator state to the composed rollout wrapper.
 
-        name = self.config.hybrid_connector
-        if name == "mp_labeled_frames":
-            return MpLabeledFramesConnector()
-        if name == "segment_endpoints":
-            return SegmentEndpointsConnector()
-        raise ValueError(
-            f"Unknown hybrid_connector {name!r}; expected 'mp_labeled_frames' or 'segment_endpoints'"
-        )
-
-    def _init_mp_rescaling_context(
-        self,
-        *,
-        dataset_root: Path | str | None = None,
-    ) -> MpActionRescalingRolloutContext | None:
-        """Resolve the MP inverse-rescaling registry tied to this policy's training dataset."""
-        from dataset.core.mp_action_rescaling import resolve_mp_action_rescaling_context
-
-        pretrained_path = Path(self.config.pretrained_path) if self.config.pretrained_path else None
-        return resolve_mp_action_rescaling_context(
-            registry_path=self.config.mp_action_rescaling_registry_path,
-            strategy_name=self.config.mp_action_rescaling_strategy,
-            dataset_root=dataset_root,
-            pretrained_path=pretrained_path,
-        )
+        Lets eval hooks and existing tests keep reading ``policy._connector``,
+        ``policy._chunk_t``, ``policy._ompl_trackers``, etc. Falls through to
+        ``nn.Module.__getattr__`` for registered parameters / submodules.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        if name == "_segment_rollout":
+            raise AttributeError(name)
+        try:
+            rollout = object.__getattribute__(self, "_segment_rollout")
+        except AttributeError as exc:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            ) from exc
+        if hasattr(rollout, name):
+            return getattr(rollout, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def reset(self):
         """Clear ACT queues and hybrid orchestrator chunk state."""
@@ -208,328 +139,52 @@ class ACTSegmentPolicy(ACTPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-
-        self._select_action_batchsize: int = None
-        self._chunk_actions: Tensor | None = None
-        self._chunk_labels: Tensor | None = None
-        self._chunk_t: list[int] = []
-        self._chunk_horizons: list[int] = []
-        self._targets_by_frame: list[dict[int, PlanningTarget]] = []
-        self._executed_target_ids: list[set[int]] = []
-        self._ik_pending: IkPending | None = None
-        self._chunk_anchor_steps: list[int] = []
-        self._rollout_step: int = 0
-        self._last_step_telemetry: list[HybridStepTelemetry | None] = []
-        self._completed_chunks: list[HybridChunkTelemetry] = []
-        self._last_step_ik_mask: list[bool] = []
-        self._last_step_skip_postprocess_mask: list[bool] = []
-        self._ompl_trackers: list[Any | None] = []
-        self._ompl_plan_retries: list[int] = []
-        self._ompl_plan_exhausted: list[bool] = []
-        self._ompl_last_failure: list[dict[str, Any] | None] = []
-        # Intentionally not cleared on reset: wired once via bind_eval_env for the VectorEnv lifetime.
-        if not hasattr(self, "_eval_vector_env"):
-            self._eval_vector_env: Any | None = None
-        if not hasattr(self, "_dummy_action"):
-            self._dummy_action: Sequence[float] | None = None
+        self._segment_rollout.reset()
 
     def set_rollout_action_processors(
         self,
         postprocessor: Any | None,
         *,
-        mp_rescaling_ctx: Any | None = _UNSET_MP_RESCALING_CTX,
+        mp_rescaling_ctx: Any | None = _segment_rollout_mod._UNSET_MP_RESCALING_CTX,
     ) -> None:
-        """Attach eval-time action postprocessing used inside :meth:`select_action`.
-
-        MP rescaling context is resolved once at policy construction from the training
-        dataset registry. Pass ``mp_rescaling_ctx`` only when overriding that default.
-        """
-        self._rollout_postprocessor = postprocessor
-        if mp_rescaling_ctx is not _UNSET_MP_RESCALING_CTX:
-            self._mp_rescaling_ctx = mp_rescaling_ctx
+        """Attach eval-time action postprocessing used inside :meth:`select_action`."""
+        self._segment_rollout.set_rollout_action_processors(
+            postprocessor, mp_rescaling_ctx=mp_rescaling_ctx
+        )
 
     def set_dummy_action(self, action: Sequence[float] | None) -> None:
         """Override the no-op action used for ``ik_pose_setter`` MP trigger frames."""
-        self._dummy_action = None if action is None else list(action)
+        self._segment_rollout.set_dummy_action(action)
 
     def bind_eval_env(self, env: Any | None) -> None:
-        """Associate this policy with a VectorEnv for hybrid MP (Layer-1 OMPL RPC).
-
-        For ``mp_executor_type='ompl_waypoints'``, ``_select_action_hybrid`` calls
-        ``env.call('plan_ompl_indexed', ...)`` on MP triggers. Worker envs must expose
-        that method (thin shim over :func:`lerobot.envs.hybrid_mp_planning.plan_ompl_indexed`).
-
-        Pass ``env=None`` to clear the association.
-        """
-        self._eval_vector_env = env
-
-    def _mp_rescaling_keys_for_batch(
-        self,
-        batch: dict[str, Tensor],
-        batch_size: int,
-    ) -> list[str]:
-        """Return registry lookup keys for MP inverse-rescaling.
-
-        Require ``mp_rescale_key`` (LIBERO task stem from eval).
-        """
-        if "mp_rescale_key" in batch:
-            keys_source = batch["mp_rescale_key"]
-        else:
-            raise KeyError(
-                "Key 'mp_rescale_key' required in batch for _mp_rescaling_keys_for_batch"
-            )
-
-        if isinstance(keys_source, (list, tuple)):
-            keys = [str(key) for key in keys_source]
-            if len(keys) < batch_size:
-                keys.extend([""] * (batch_size - len(keys)))
-            return keys[:batch_size]
-        return [str(keys_source)] * batch_size
-
-    def _frame_labels_for_batch(self, batch_size: int) -> list[int | None]:
-        labels: list[int | None] = [
-            int(t.frame_label) if t is not None else None for t in self._last_step_telemetry
-        ]
-        if len(labels) < batch_size:
-            labels.extend([None] * (batch_size - len(labels)))
-        return labels[:batch_size]
-
-    def _finalize_rollout_action_tensor(
-        self,
-        action: Tensor,
-        *,
-        mp_rescaling_keys: Sequence[str],
-        frame_labels: Sequence[int | None],
-    ) -> Tensor:
-        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
-            return action
-
-        finalized = action
-        device = finalized.device
-        if self._rollout_postprocessor is not None:
-            finalized = self._rollout_postprocessor(finalized)
-            finalized = finalized.to(device=device)
-
-        if self._mp_rescaling_ctx is not None:
-            from hybrid_eval.eval.mp_action_rescaling_rollout import (
-                apply_mp_action_rescaling_to_actions,
-            )
-
-            action_np = finalized.detach().cpu().numpy().astype("float64", copy=False)
-            action_np = apply_mp_action_rescaling_to_actions(
-                action_np,
-                mp_rescaling_keys,
-                frame_labels,
-                self._mp_rescaling_ctx,
-            )
-            finalized = torch.as_tensor(action_np, dtype=torch.float32, device=device)
-
-        return finalized
-
-    def _finalize_planning_target(
-        self,
-        target: Any,
-        *,
-        mp_rescaling_key: str = "",
-        frame_label: int | None = None,
-    ) -> Any:
-        """Unnormalize (+ optional MP inverse-rescale) a ``PlanningTarget`` action.
-
-        Used by IK pending (after ``select_action``) and OMPL Layer-1 goal resolution
-        (before ``plan_ompl_indexed``) so both paths consume environment-ready actions.
-        """
-        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
-            return target
-
-        from dataclasses import replace
-
-        from hybrid_eval.eval.mp_action_rescaling_rollout import (
-            apply_mp_action_rescaling_to_actions,
-        )
-
-        action_t = torch.as_tensor(target.action, dtype=torch.float32).unsqueeze(0)
-        if self._rollout_postprocessor is not None:
-            action_t = self._rollout_postprocessor(action_t)
-        action_np = action_t.squeeze(0).detach().cpu().numpy().astype("float64", copy=False)
-
-        if self._mp_rescaling_ctx is not None:
-            action_np = apply_mp_action_rescaling_to_actions(
-                action_np.reshape(1, -1),
-                [mp_rescaling_key],
-                [frame_label],
-                self._mp_rescaling_ctx,
-            )[0]
-
-        return replace(target, action=action_np)
-
-    def _finalize_ik_pending(
-        self,
-        *,
-        mp_rescaling_keys: Sequence[str],
-        frame_labels: Sequence[int | None],
-    ) -> None:
-        if self._ik_pending is None:
-            return
-        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
-            return
-
-        finalized_targets: list[Any | None] = []
-        for row, target in enumerate(self._ik_pending.targets):
-            if target is None or not self._ik_pending.mask[row]:
-                finalized_targets.append(target)
-                continue
-
-            label = frame_labels[row] if row < len(frame_labels) else None
-            task = mp_rescaling_keys[row] if row < len(mp_rescaling_keys) else ""
-            finalized_targets.append(
-                self._finalize_planning_target(
-                    target,
-                    mp_rescaling_key=task,
-                    frame_label=label,
-                )
-            )
-
-        self._ik_pending.targets = finalized_targets
-
-    def _finalize_select_action_output(
-        self,
-        batch: dict[str, Tensor],
-        action: Tensor,
-    ) -> Tensor:
-        batch_size = int(action.shape[0])
-        frame_labels = self._frame_labels_for_batch(batch_size)
-        if self._mp_rescaling_ctx is not None:
-            mp_rescaling_keys = self._mp_rescaling_keys_for_batch(batch, batch_size)
-        else:
-            mp_rescaling_keys = [""] * batch_size
-        finalized = action.clone()
-
-        # Prefer explicit skip mask (OMPL OSC + IK dummy); fall back to IK mask.
-        skip_mask = self._last_step_skip_postprocess_mask or self._last_step_ik_mask
-        policy_rows = [
-            row
-            for row in range(batch_size)
-            if row >= len(skip_mask) or not skip_mask[row]
-        ]
-        if policy_rows:
-            row_index = torch.tensor(policy_rows, dtype=torch.long, device=action.device)
-            subset = self._finalize_rollout_action_tensor(
-                finalized[row_index],
-                mp_rescaling_keys=[mp_rescaling_keys[row] for row in policy_rows],
-                frame_labels=[frame_labels[row] for row in policy_rows],
-            )
-            finalized[row_index] = subset
-
-        self._finalize_ik_pending(
-            mp_rescaling_keys=mp_rescaling_keys,
-            frame_labels=frame_labels,
-        )
-        return finalized
+        """Associate this policy with a VectorEnv for hybrid MP (Layer-1 OMPL RPC)."""
+        self._segment_rollout.bind_eval_env(env)
 
     def set_rollout_step(self, step: int) -> None:
         """Set the current episode step index (used for chunk anchor bookkeeping)."""
-        self._rollout_step = int(step)
+        self._segment_rollout.set_rollout_step(step)
 
     def consume_ik_pending(self) -> IkPending | None:
         """Return and clear IK targets from the last ``select_action`` call."""
-        pending = self._ik_pending
-        self._ik_pending = None
-        if pending is None or not any(pending.mask):
-            return None
-        return pending
+        return self._segment_rollout.consume_ik_pending()
 
     def consume_hybrid_step_telemetry(self) -> list[HybridStepTelemetry | None]:
         """Return and clear per-row telemetry from the last ``select_action`` call."""
-        telemetry = self._last_step_telemetry
-        self._last_step_telemetry = []
-        return telemetry
+        return self._segment_rollout.consume_hybrid_step_telemetry()
 
     def pop_completed_chunks(self) -> list[HybridChunkTelemetry]:
         """Return and clear policy chunks completed since the last pop."""
-        completed = self._completed_chunks
-        self._completed_chunks = []
-        return completed
+        return self._segment_rollout.pop_completed_chunks()
 
     def finalize_rollout_chunks(self) -> list[HybridChunkTelemetry]:
         """Emit any in-progress chunks at episode end (call before ``reset``)."""
-        if self._chunk_actions is None:
-            return []
-        from hybrid_eval.orchestrator import HybridPolicyOutput
-
-        batch_size = self._select_action_batchsize
-        finalized: list[HybridChunkTelemetry] = []
-        for row in range(batch_size):
-            if self._chunk_t[row] <= 0:
-                continue
-            finalized.append(
-                HybridChunkTelemetry(
-                    row=row,
-                    anchor_step=int(self._chunk_anchor_steps[row]),
-                    orchestrator_output=self._snapshot_chunk_output(row),
-                )
-            )
-        self._completed_chunks.extend(finalized)
-        return self.pop_completed_chunks()
-
-    def _snapshot_chunk_output(self, row: int) -> Any:
-        from dataset.core.frame_labels import FrameLabelEnum
-        from hybrid_eval.orchestrator import HybridPolicyOutput
-
-        assert self._chunk_actions is not None
-        assert self._chunk_labels is not None
-        horizon = int(self._chunk_horizons[row])
-        actions_np = self._chunk_actions[row, :horizon].detach().cpu().numpy()
-        labels_np = self._chunk_labels[row, :horizon].detach().cpu().numpy()
-        labels_str = tuple(FrameLabelEnum.to_str(int(v)) for v in labels_np)
-        targets = tuple(self._targets_by_frame[row].values())
-        return HybridPolicyOutput(
-            actions=actions_np,
-            frame_labels=labels_np,
-            frame_labels_str=labels_str,
-            planning_targets=targets,
-        )
+        return self._segment_rollout.finalize_rollout_chunks()
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.image_features:
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
         return batch
-
-    def _label_targets(self, batch: dict[str, Tensor]) -> Tensor:
-        labels = batch[self.config.label_feature_key]
-        if labels.ndim == 3:
-            labels = labels.squeeze(-1)
-        return labels.long()
-
-    def _label_valid_mask(self, batch: dict[str, Tensor]) -> Tensor:
-        pad_key = f"{self.config.label_feature_key}_is_pad"
-        if pad_key in batch:
-            return ~batch[pad_key]
-        return ~batch["action_is_pad"]
-
-    def _masked_l1_mean(self, abs_err: Tensor, mask: Tensor) -> Tensor:
-        num_valid = mask.sum() * abs_err.shape[-1]
-        return (abs_err * mask).sum() / num_valid.clamp_min(1)
-
-    def _masked_ce_mean(self, per_step_ce: Tensor, mask: Tensor) -> Tensor:
-        """Mean CE over masked steps; empty mask contributes 0."""
-        return (per_step_ce * mask).sum() / mask.sum().clamp_min(1)
-
-    def _mp_l_label_masks(self, batch: dict[str, Tensor], label_valid_mask: Tensor) -> tuple[Tensor, Tensor]:
-        """MP/L masks over valid label steps (ground-truth frame type)."""
-        from dataset.core.frame_labels import FrameLabelEnum
-
-        labels = self._label_targets(batch)
-        mp_mask = FrameLabelEnum.is_mp_frame_label_array(labels)
-        l_mask = FrameLabelEnum.is_l_frame_label_array(labels)
-        return label_valid_mask & mp_mask, label_valid_mask & l_mask
-
-    def _mp_l_action_masks(self, batch: dict[str, Tensor], action_valid_mask: Tensor) -> tuple[Tensor, Tensor]:
-        """MP mask = MP-labeled valid steps; L mask = L-labeled valid steps."""
-        label_valid_mask = self._label_valid_mask(batch)
-        step_valid = action_valid_mask.squeeze(-1) & label_valid_mask
-        mp_step, l_step = self._mp_l_label_masks(batch, step_valid)
-        return mp_step.unsqueeze(-1), l_step.unsqueeze(-1)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -545,7 +200,7 @@ class ACTSegmentPolicy(ACTPolicy):
         batch = self._prepare_batch(batch)
         _actions, labels_logits, _vae_params = self.model(batch)
         return labels_logits.argmax(dim=-1)
-    
+
     @torch.no_grad()
     def predict_action_label_chunk(
         self,
@@ -563,646 +218,15 @@ class ACTSegmentPolicy(ACTPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select one action per env; hybrid orchestrator routes MP triggers to dummy IK steps."""
+        """Select one action per env; hybrid orchestrator routes MP triggers to dummy IK steps.
+
+        Vanilla (non-hybrid) ACT leaves postprocessing to the outer eval loop.
+        Hybrid mode finalizes inside :class:`SegmentRolloutWrapper`.
+        """
         if not self.config.use_hybrid_orchestrator:
-            action = super().select_action(batch)
-        else:
-            # Extract the batch size from the 'batch' dict, assuming any tensor value
-            first_tensor = next(v for v in batch.values() if isinstance(v, torch.Tensor))
-            actual_batch_size = first_tensor.shape[0]
-
-            # we fix a batch size for ```select_action``` that is fixed until policy is reset
-            if self._select_action_batchsize is None:
-                self._select_action_batchsize = actual_batch_size
-            elif self._select_action_batchsize != actual_batch_size:
-                raise ValueError(
-                    f"Batch size mismatch in select_action: expected {self._select_action_batchsize}, "
-                    f"but got {actual_batch_size}. Batch size must remain fixed across calls until reset."
-                )
-
-            action = self._select_action_hybrid(batch)
-
-        if self._rollout_postprocessor is None and self._mp_rescaling_ctx is None:
-            return action
-        return self._finalize_select_action_output(batch, action)
-
-    def _first_mp_frame_index(self, labels_row: Tensor) -> int | None:
-        from dataset.core.frame_labels import FrameLabelEnum
-
-        for t in range(labels_row.shape[0]):
-            if FrameLabelEnum.is_mp_frame_label(int(labels_row[t].item())):
-                return t
-        return None
-
-    def _first_contiguous_mp_run(self, labels_row: Tensor) -> tuple[int, int] | None:
-        """Half-open ``[start, end)`` of the first contiguous MP run, or None if no MP.
-
-        Contiguity ignores intermediate ``B-MP`` waypoint boundaries; only an L frame
-        (or the end of the label row) ends the run.
-        """
-        from dataset.core.segments import contiguous_mp_runs, iter_labeled_spans
-
-        runs = contiguous_mp_runs(iter_labeled_spans(labels_row.detach().cpu().numpy()))
-        if not runs:
-            return None
-        start = int(runs[0][0][0])
-        end = int(runs[0][-1][1])
-        return start, end
-
-    def _effective_chunk_horizon(self, labels_row: Tensor) -> int:
-        mode = self.config.hybrid_refill_mode
-        if mode == "full_chunk":
-            return self.config.n_action_steps
-
-        if mode in ("until_first_mp_segment", "trust_contiguous_mp"):
-            run = self._first_contiguous_mp_run(labels_row)
-            if run is None:
-                return self.config.n_action_steps
-            start, end = run
-            followed_by_l = end < int(labels_row.shape[0])
-            if mode == "until_first_mp_segment":
-                return end
-            # trust_contiguous_mp: only commit when an L proves the run is complete.
-            if followed_by_l:
-                return end
-            return start
-
-        first_mp = self._first_mp_frame_index(labels_row)
-        if first_mp is None:
-            return self.config.n_action_steps
-
-        if mode == "until_first_mp":
-            return first_mp + 1
-
-        if mode == "trust_near_mp":
-            k = self.config.hybrid_refill_mp_trust_steps
-            if first_mp < k:
-                return first_mp + 1
-            return first_mp
-
-        raise ValueError(
-            f"Unknown hybrid_refill_mode {mode!r}; expected "
-            "'full_chunk', 'until_first_mp', 'until_first_mp_segment', "
-            "'trust_contiguous_mp', or 'trust_near_mp'"
-        )
-
-    def _refill_hybrid_rows(
-        self,
-        batch: dict[str, Tensor],
-        rows: Sequence[int],
-        *,
-        sample_latent_prior: bool = False,
-    ) -> None:
-        """
-        Recompute (refill) action and label chunk rows for the hybrid orchestrator.
+            return super().select_action(batch)
         
-        If called while `self._chunk_actions` is None, `rows` must cover the entire batch (0..batch_size-1), 
-        otherwise throws a ValueError. This ensures we fill the full set of per-row memory.
-
-        When ``sample_latent_prior`` is true, ACT samples ``z ~ N(0, I)`` so requeries after
-        OMPL failure are not identical to the deterministic zero-latent decode.
-        """
-        assert self._connector is not None
-        from hybrid_eval.eval.hybrid_rollout import group_targets_by_execution_frame
-
-        # Remove duplicates and sort rows ascending
-        rows = sorted(set(rows))
-        batch_size = self._select_action_batchsize
-
-        # Check for full batch coverage on first call if chunk actions are not yet initialized
-        if self._chunk_actions is None and rows != list(range(batch_size)):
-            raise ValueError(
-                "On first call to _refill_hybrid_rows, rows must be the full batch range "
-                f"(0..{batch_size - 1}) but got {rows}."
-            )
-
-        # Only run prediction for the requested rows, efficiently batching if possible
-        if len(rows) == 0:
-            return
-
-        # Build mini-batch for inference
-        # Check that values are tensors before indexing
-        per_row_batch = {
-            k: (v[rows] if isinstance(v, torch.Tensor) else v)
-            for k, v in batch.items()
-        }
-        actions, labels = self.predict_action_label_chunk(
-            per_row_batch, sample_latent_prior=sample_latent_prior
-        )
-        actions = actions[:, : self.config.n_action_steps]
-        labels = labels[:, : self.config.n_action_steps]
-
-        # Initialize storage structures if needed
-        if self._chunk_actions is None:
-            self._chunk_actions = actions.clone()
-            self._chunk_labels = labels.clone()
-            self._targets_by_frame = [{} for _ in range(batch_size)]
-            self._executed_target_ids = [set() for _ in range(batch_size)]
-            self._chunk_t = [0] * batch_size
-            self._chunk_horizons = [self.config.n_action_steps] * batch_size
-            self._chunk_anchor_steps = [self._rollout_step] * batch_size
-
-        # Now update only requested rows with fresh chunk
-        for i, row in enumerate(rows):
-            if self._chunk_t[row] > 0:
-                self._completed_chunks.append(
-                    HybridChunkTelemetry(
-                        row=row,
-                        anchor_step=int(self._chunk_anchor_steps[row]),
-                        orchestrator_output=self._snapshot_chunk_output(row),
-                    )
-                )
-            horizon = self._effective_chunk_horizon(labels[i])
-            self._chunk_actions[row] = actions[i]
-            self._chunk_labels[row] = labels[i]
-            self._chunk_horizons[row] = horizon
-            self._chunk_t[row] = 0
-            self._chunk_anchor_steps[row] = self._rollout_step
-
-            # Connector copies policy-output (normalized) actions into PlanningTarget.
-            # Unnormalization + MP inverse rescaling run later: OMPL at plan start
-            # (``_finalize_planning_target``), IK via ``_finalize_ik_pending``.
-            actions_np = actions[i].detach().cpu().numpy()
-            labels_np = labels[i].detach().cpu().numpy()
-            targets = self._connector.planning_targets(actions_np, labels_np)
-            grouped = group_targets_by_execution_frame(targets)
-            self._targets_by_frame[row] = {frame: target for frame, target in grouped.items() if frame < horizon}
-            self._executed_target_ids[row] = set()
-
-    def _ensure_ompl_row_state(self, batch_size: int) -> None:
-        if not self._ompl_trackers:
-            self._ompl_trackers = [None] * batch_size
-        elif len(self._ompl_trackers) != batch_size:
-            raise ValueError(
-                f"ompl tracker batch mismatch: {len(self._ompl_trackers)} vs {batch_size}"
-            )
-        if len(self._ompl_plan_retries) != batch_size:
-            self._ompl_plan_retries = [0] * batch_size
-        if len(self._ompl_plan_exhausted) != batch_size:
-            self._ompl_plan_exhausted = [False] * batch_size
-        if len(self._ompl_last_failure) != batch_size:
-            self._ompl_last_failure = [None] * batch_size
-
-    def _handle_ompl_plan_exhausted(
-        self,
-        row: int,
-        *,
-        status: str,
-        failure: dict[str, Any] | None,
-    ) -> None:
-        import logging
-
-        from hybrid_eval.planning.ompl_motion_planner import OmplSoftPlanFailure
-
-        attempts = int(self._ompl_plan_retries[row]) + 1
-        soft = OmplSoftPlanFailure.from_mapping(
-            failure,
-            attempts=attempts,
-            default_status=status,
-        )
-        message = (
-            f"OMPL plan retries exhausted for env row={row} after {attempts} attempt(s); "
-            f"last_status={soft.status!r}\n{soft.message}"
-        )
-        # Persist a structured record (status/message/attempts + raw planner payload).
-        recorded = {
-            **dict(soft.detail),
-            "ok": False,
-            "status": soft.status,
-            "message": soft.message,
-            "attempts": attempts,
-            "row": int(row),
-        }
-        on_exhausted = str(self.config.ompl_plan_on_exhausted).strip().lower()
-        if on_exhausted == "terminate_hold":
-            self._ompl_plan_exhausted[row] = True
-            self._ompl_last_failure[row] = recorded
-            logging.getLogger(__name__).warning(message)
-            return
-        if on_exhausted != "raise":
-            raise ValueError(
-                f"Unknown ompl_plan_on_exhausted={self.config.ompl_plan_on_exhausted!r}; "
-                "expected 'raise' or 'terminate_hold'"
-            )
-        raise OmplPlanRetriesExhausted(
-            message,
-            row=row,
-            status=soft.status,
-            attempts=attempts,
-            last_failure=recorded,
-        )
-
-    def _plan_ompl_rows_with_retries(
-        self,
-        rows: Sequence[int],
-        batch_size: int,
-        batch: dict[str, Tensor],
-    ) -> None:
-        """Plan MP triggers for *rows*, requerying the policy on soft OMPL failures."""
-        from lerobot.envs.hybrid_mp_planning import ompl_plan_failure_status
-
-        pending = sorted(set(rows))
-        # Per-call: whether this row already got a timeout time-limit bump (without refill).
-        timeout_bumped = {row: False for row in pending}
-
-        while pending:
-            time_limits = {
-                row: (
-                    float(self.config.ompl_time_limit)
-                    * (
-                        float(self.config.ompl_retry_time_limit_scale)
-                        if timeout_bumped[row]
-                        else 1.0
-                    )
-                )
-                for row in pending
-            }
-            outcomes = self._start_ompl_trackers_for_rows(
-                pending, batch_size, batch, time_limits=time_limits
-            )
-            next_pending: list[int] = []
-            requery_rows: list[int] = []
-
-            for row in pending:
-                outcome = outcomes.get(row)
-                if outcome is not None and outcome.get("ok") is True and self._ompl_trackers[row] is not None:
-                    self._ompl_plan_retries[row] = 0
-                    self._ompl_last_failure[row] = None
-                    continue
-
-                failure = outcome if isinstance(outcome, dict) else None
-                status = ompl_plan_failure_status(failure) if failure is not None else "skipped"
-                # ``None`` skip from on_ik_failure='skip' → treat as soft failure.
-                if failure is None:
-                    failure = {"ok": False, "status": status, "message": "OMPL plan skipped"}
-
-                self._ompl_last_failure[row] = failure
-
-                # Invalid start cannot be fixed by requerying the same observation.
-                if _ompl_status_is_invalid_start(status):
-                    self._handle_ompl_plan_exhausted(row, status=status, failure=failure)
-                    continue
-
-                # First timeout: replan same target with a longer budget before requerying.
-                if (
-                    _ompl_status_is_timeout(status)
-                    and not timeout_bumped[row]
-                    and float(self.config.ompl_retry_time_limit_scale) > 1.0
-                ):
-                    timeout_bumped[row] = True
-                    next_pending.append(row)
-                    continue
-
-                max_retries = int(self.config.ompl_plan_max_retries)
-                if self._ompl_plan_retries[row] >= max_retries:
-                    self._handle_ompl_plan_exhausted(row, status=status, failure=failure)
-                    continue
-
-                self._ompl_plan_retries[row] += 1
-                requery_rows.append(row)
-                timeout_bumped[row] = False
-                next_pending.append(row)
-
-            if requery_rows:
-                self._refill_hybrid_rows(
-                    batch,
-                    requery_rows,
-                    sample_latent_prior=bool(self.config.ompl_retry_sample_latent),
-                )
-            pending = next_pending
-
-    @torch.no_grad()
-    def _select_action_hybrid(self, batch: dict[str, Tensor]) -> Tensor:
-        from dataset.core.frame_labels import FrameLabelEnum
-
-        batch_size = self._select_action_batchsize
-        self._ensure_ompl_row_state(batch_size)
-
-        # Finish completed OMPL plans before refill so chunk_t can advance.
-        for row in range(batch_size):
-            tracker = self._ompl_trackers[row]
-            if tracker is not None and tracker.done:
-                self._ompl_trackers[row] = None
-                self._chunk_t[row] += 1
-
-        # Rows mid-OMPL tracking pause chunk drain; exclude them from refill.
-        if self._chunk_actions is None:
-            rows_to_refill = list(range(batch_size))
-        else:
-            rows_to_refill = [
-                row
-                for row in range(batch_size)
-                if self._ompl_trackers[row] is None
-                and not self._ompl_plan_exhausted[row]
-                and self._chunk_t[row] >= self._chunk_horizons[row]
-            ]
-        if rows_to_refill:
-            self._refill_hybrid_rows(batch, rows_to_refill)
-
-        assert self._chunk_actions is not None
-        assert self._chunk_labels is not None
-
-        action_dim = self._chunk_actions.shape[-1]
-        device = self._chunk_actions.device
-        dtype = self._chunk_actions.dtype
-        dummy_vals = self._dummy_action if self._dummy_action is not None else get_libero_dummy_action()
-        dummy = torch.tensor(dummy_vals, device=device, dtype=dtype)
-
-        actions_out = torch.empty(batch_size, action_dim, device=device, dtype=dtype)
-        ik_targets: list[Any | None] = [None] * batch_size
-        ik_mask = [False] * batch_size
-        skip_postprocess = [False] * batch_size
-        step_telemetry: list[HybridStepTelemetry | None] = [None] * batch_size
-
-        # Batch Layer-1 planning for rows that newly trigger MP under ompl_waypoints.
-        ompl_plan_requests: list[int] = []
-        if self.config.mp_executor_type == "ompl_waypoints":
-            for row in range(batch_size):
-                if self._ompl_trackers[row] is not None or self._ompl_plan_exhausted[row]:
-                    continue
-                chunk_t = self._chunk_t[row]
-                if chunk_t >= self._chunk_horizons[row]:
-                    continue
-                target = self._targets_by_frame[row].get(chunk_t)
-                if target is not None and id(target) not in self._executed_target_ids[row]:
-                    ompl_plan_requests.append(row)
-
-            if ompl_plan_requests:
-                self._plan_ompl_rows_with_retries(ompl_plan_requests, batch_size, batch)
-
-        for row in range(batch_size):
-            chunk_t = self._chunk_t[row]
-            label = int(self._chunk_labels[row, chunk_t].item())
-            action_source = "none"
-            proccessed_mp_action = False
-            ee_wp: tuple[float, ...] | None = None
-            wp_index: int | None = None
-            plan_done = False
-            plan_failed = False
-            plan_exhausted = bool(self._ompl_plan_exhausted[row])
-            retry_index: int | None = (
-                int(self._ompl_plan_retries[row]) if self._ompl_plan_retries[row] > 0 else None
-            )
-            failure_status = None
-            failure_message = None
-            failure_attempts = None
-            failure_detail = None
-            if self._ompl_last_failure[row] is not None:
-                from lerobot.envs.hybrid_mp_planning import ompl_plan_failure_status
-
-                failure = self._ompl_last_failure[row]
-                failure_status = ompl_plan_failure_status(failure)
-                failure_message = (
-                    None if failure is None else str(failure.get("message") or failure_status)
-                )
-                if failure is not None and failure.get("attempts") is not None:
-                    failure_attempts = int(failure["attempts"])
-                elif plan_exhausted:
-                    failure_attempts = int(self._ompl_plan_retries[row]) + 1
-                failure_detail = None if failure is None else dict(failure)
-                # PNG stills are only needed once for the live recorder; drop them from
-                # the cached failure so later exhaust-hold steps stay lightweight.
-                if (
-                    plan_exhausted
-                    and isinstance(self._ompl_last_failure[row], dict)
-                    and "failure_stills" in self._ompl_last_failure[row]
-                ):
-                    cached = dict(self._ompl_last_failure[row])
-                    cached.pop("failure_stills", None)
-                    self._ompl_last_failure[row] = cached
-
-            # Deal with OMPL waypoint mode
-            if self.config.mp_executor_type == "ompl_waypoints":
-                tracker = self._ompl_trackers[row]
-                if plan_exhausted:
-                    # Soft-stop: hold with dummy so the outer eval loop can terminate cleanly.
-                    actions_out[row] = dummy
-                    skip_postprocess[row] = True
-                    action_source = "mp_plan_exhausted"
-                    plan_failed = True
-                    proccessed_mp_action = True
-                elif tracker is not None and not tracker.done:
-                    live_ee = self._live_ee_pose_for_row(batch, row)
-                    osc = tracker.step(live_ee)
-                    actions_out[row] = torch.as_tensor(osc, device=device, dtype=dtype)
-                    skip_postprocess[row] = True
-                    action_source = "mp"
-                    ee_wp = tuple(float(x) for x in tracker.current_waypoint.tolist())
-                    wp_index = int(tracker.cursor)
-                    plan_done = bool(tracker.done)
-                    # Pause chunk_t while tracking.
-                    proccessed_mp_action = True
-                else:
-                    # MP trigger still pending without a tracker means planning failed mid-call
-                    # without installing a path — never fall through to raw MP-as-OSC.
-                    target = self._targets_by_frame[row].get(chunk_t)
-                    if target is not None and id(target) not in self._executed_target_ids[row]:
-                        actions_out[row] = dummy
-                        skip_postprocess[row] = True
-                        action_source = "mp_plan_failed"
-                        plan_failed = True
-                        proccessed_mp_action = True
-            # Deal with IK pose setter mode
-            elif self.config.mp_executor_type == "ik_pose_setter":
-                target = self._targets_by_frame[row].get(chunk_t)
-                if target is not None and id(target) not in self._executed_target_ids[row]:
-                    # Dummy OSC action; real MP motion via IkPending after env.step.
-                    actions_out[row] = dummy
-                    ik_targets[row] = target
-                    ik_mask[row] = True
-                    skip_postprocess[row] = True
-                    action_source = "mp"
-                    self._executed_target_ids[row].add(id(target))
-                    self._chunk_t[row] += 1
-
-                    proccessed_mp_action = True
-            else:
-                raise NotImplementedError(
-                    f"mp_executor_type {self.config.mp_executor_type!r} is not supported yet"
-                )
-            
-            # If we haven't processed MP actions, return latest action from policy (presumed L label)
-            if not proccessed_mp_action:
-                actions_out[row] = self._chunk_actions[row, chunk_t]
-                action_source = "policy"
-                self._chunk_t[row] += 1
-
-            step_telemetry[row] = HybridStepTelemetry(
-                frame_label=label,
-                frame_label_str=FrameLabelEnum.to_str(label),
-                output_frame_index=chunk_t,
-                action_source=action_source,
-                is_new_chunk=chunk_t == 0,
-                chunk_anchor_step=int(self._chunk_anchor_steps[row]),
-                ee_waypoint=ee_wp,
-                ompl_waypoint_index=wp_index,
-                ompl_plan_done=plan_done,
-                ompl_plan_failed=plan_failed,
-                ompl_retry_index=retry_index,
-                ompl_failure_status=failure_status,
-                ompl_failure_message=failure_message,
-                ompl_failure_attempts=failure_attempts,
-                ompl_failure_detail=failure_detail,
-                ompl_plan_exhausted=plan_exhausted,
-            )
-
-        self._ik_pending = IkPending(targets=ik_targets, mask=ik_mask)
-        self._last_step_telemetry = step_telemetry
-        self._last_step_ik_mask = list(ik_mask)
-        self._last_step_skip_postprocess_mask = list(skip_postprocess)
-        return actions_out
-
-    def _live_ee_pose_for_row(self, batch: dict[str, Tensor], row: int) -> np.ndarray:
-        """Read physical 6-D EE pose from complementary batch key ``live_ee_pose``."""
-        if "live_ee_pose" not in batch:
-            raise RuntimeError(
-                "ompl_waypoints requires batch['live_ee_pose'] before select_action "
-                "(physical EE from env-preprocessed observation; preserved by preprocessor)"
-            )
-        poses = batch["live_ee_pose"]
-        if row >= int(poses.shape[0]):
-            raise RuntimeError(
-                f"ompl_waypoints live_ee_pose batch too short: row={row}, size={poses.shape[0]}"
-            )
-        pose = poses[row]
-        if isinstance(pose, torch.Tensor):
-            return pose.detach().cpu().numpy().astype(np.float64).reshape(6)
-        return np.asarray(pose, dtype=np.float64).reshape(6)
-
-    def _start_ompl_trackers_for_rows(
-        self,
-        rows: Sequence[int],
-        batch_size: int,
-        batch: dict[str, Tensor],
-        *,
-        time_limits: dict[int, float] | None = None,
-    ) -> dict[int, dict[str, Any] | None]:
-        """Run Layer-1 planning for *rows* and install :class:`WaypointOscTracker`s.
-
-        Returns a per-row outcome map: success installs a tracker and maps to
-        ``{"ok": True}``; soft failures / skips return the failure payload or ``None``.
-        """
-        from lerobot.envs.hybrid_mp_planning import (
-            is_ompl_plan_failure,
-            is_ompl_plan_success,
-            ompl_plan_failure_status,
-        )
-        from hybrid_eval.connectors.action_format import gripper_from_action
-        from hybrid_eval.execution.waypoint_osc import (
-            WaypointOscTracker,
-            execution_plan_from_mapping,
-        )
-
-        if self._eval_vector_env is None:
-            raise RuntimeError(
-                "ompl_waypoints requires bind_eval_env(vector_env) before select_action "
-                "(VectorEnv plan_ompl_indexed RPC)"
-            )
-
-        if self._mp_rescaling_ctx is not None:
-            mp_rescaling_keys = self._mp_rescaling_keys_for_batch(batch, batch_size)
-        else:
-            mp_rescaling_keys = [""] * batch_size
-
-        targets: list[Any | None] = [None] * batch_size
-        poses: list[np.ndarray] = [np.zeros(6, dtype=np.float64) for _ in range(batch_size)]
-        mask = [False] * batch_size
-        assert self._chunk_labels is not None
-        for row in rows:
-            chunk_t = self._chunk_t[row]
-            target = self._targets_by_frame[row].get(chunk_t)
-            if target is None:
-                continue
-            # Same physical-action path as IK: unnormalize (+ MP unrescale) before goal pose.
-            # Keep normalized originals in ``_targets_by_frame`` so plan retries stay idempotent.
-            frame_label = int(self._chunk_labels[row, chunk_t].item())
-            targets[row] = self._finalize_planning_target(
-                target,
-                mp_rescaling_key=mp_rescaling_keys[row],
-                frame_label=frame_label,
-            )
-            poses[row] = self._live_ee_pose_for_row(batch, row)
-            mask[row] = True
-
-        outcomes: dict[int, dict[str, Any] | None] = {int(row): None for row in rows}
-        if not any(mask):
-            return outcomes
-
-        cfg = self.config
-        # VectorEnv.call uses one kwargs set for all workers; use the max requested limit.
-        if time_limits:
-            active_limits = [time_limits[row] for row in rows if mask[row] and row in time_limits]
-            time_limit = max(active_limits) if active_limits else float(cfg.ompl_time_limit)
-        else:
-            time_limit = float(cfg.ompl_time_limit)
-
-        plan_results = self._eval_vector_env.call(
-            "plan_ompl_indexed",
-            targets,
-            poses,
-            mask,
-            algorithm=cfg.ompl_algorithm,
-            time_limit=time_limit,
-            include_grasped_object_in_validity=cfg.ompl_include_grasped_object_in_validity,
-            always_valid=cfg.ompl_always_valid,
-            on_ik_failure=cfg.ompl_on_ik_failure,
-            max_ee_step_m=cfg.ompl_max_ee_step_m,
-            path_interpolate_count=cfg.ompl_path_interpolate_count,
-            validity_checking_resolution=cfg.ompl_validity_checking_resolution,
-            simplify=cfg.ompl_simplify,
-            contact_dist_eps=cfg.ompl_contact_dist_eps,
-            pos_scale=cfg.ompl_pos_scale,
-            rot_scale=cfg.ompl_rot_scale,
-        )
-        # VectorEnv.call returns one result per env (list); Sync may return list of dicts.
-        if not isinstance(plan_results, (list, tuple)):
-            plan_results = [plan_results]
-
-        for row in rows:
-            if row >= len(plan_results):
-                outcomes[row] = {
-                    "ok": False,
-                    "status": "missing_result",
-                    "message": f"plan_ompl_indexed returned no result for row={row}",
-                }
-                continue
-            mapping = plan_results[row]
-            target = targets[row]
-            if not mask[row] or target is None or mapping is None:
-                outcomes[row] = None
-                continue
-            if is_ompl_plan_failure(mapping):
-                outcomes[row] = dict(mapping)
-                continue
-            if not is_ompl_plan_success(mapping):
-                outcomes[row] = {
-                    "ok": False,
-                    "status": ompl_plan_failure_status(mapping),
-                    "message": f"Unrecognized plan_ompl_indexed payload for row={row}: {type(mapping)}",
-                }
-                continue
-
-            plan = execution_plan_from_mapping(mapping)
-            grip = gripper_from_action(target.action, target.action_format)
-            tracker = WaypointOscTracker(
-                plan=plan,
-                gripper_cmd=0.0 if grip is None else float(grip),
-                pos_tol_m=float(cfg.ompl_pos_tol_m),
-                ori_tol_rad=cfg.ompl_ori_tol_rad,
-                max_steps_per_waypoint=int(cfg.ompl_max_steps_per_waypoint),
-                pos_scale=float(cfg.ompl_pos_scale),
-                rot_scale=float(cfg.ompl_rot_scale),
-                max_pos_delta_m=cfg.ompl_max_pos_delta_m,
-                max_ori_delta_rad=cfg.ompl_max_ori_delta_rad,
-                goal_hold_frames=int(cfg.ompl_goal_hold_frames),
-            )
-            self._ompl_trackers[row] = tracker
-            # Mark the normalized stash entry (not the finalized copy) as executed.
-            stash = self._targets_by_frame[row].get(self._chunk_t[row])
-            if stash is not None:
-                self._executed_target_ids[row].add(id(stash))
-            outcomes[row] = {"ok": True}
-        return outcomes
+        return self._segment_rollout.select_action(batch)
 
     @torch.no_grad()
     def per_step_val_losses(
@@ -1225,15 +249,15 @@ class ACTSegmentPolicy(ACTPolicy):
         action_valid_mask = ~batch["action_is_pad"]
         action_l1 = abs_err.mean(dim=-1)
 
-        label_targets = self._label_targets(batch)
-        label_valid_mask = self._label_valid_mask(batch)
+        targets = label_targets(batch, self.config.label_feature_key)
+        valid_labels = label_valid_mask(batch, self.config.label_feature_key)
         per_step_ce = F.cross_entropy(
             labels_logits.reshape(-1, self.config.num_label_classes),
-            label_targets.reshape(-1),
+            targets.reshape(-1),
             reduction="none",
         ).view(labels_logits.shape[0], labels_logits.shape[1])
 
-        valid_mask = action_valid_mask & label_valid_mask
+        valid_mask = action_valid_mask & valid_labels
         return action_l1, per_step_ce, valid_mask
 
     def forward(
@@ -1247,37 +271,31 @@ class ACTSegmentPolicy(ACTPolicy):
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         action_valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        mp_action_mask, l_action_mask = self._mp_l_action_masks(batch, action_valid_mask)
-        mp_l1_loss = self._masked_l1_mean(abs_err, mp_action_mask)
-        l_l1_loss = self._masked_l1_mean(abs_err, l_action_mask)
+        mp_action_mask, l_action_mask = mp_l_action_masks(
+            batch,
+            action_valid_mask,
+            label_feature_key=self.config.label_feature_key,
+        )
+        mp_l1_loss = masked_action_loss_mean(abs_err, mp_action_mask)
+        l_l1_loss = masked_action_loss_mean(abs_err, l_action_mask)
         weighted_l1_loss = l_l1_loss + self.config.mp_l1_weight * mp_l1_loss
 
-        label_targets = self._label_targets(batch)
-        label_valid_mask = self._label_valid_mask(batch)
-        per_step_ce = F.cross_entropy(
-            labels_logits.reshape(-1, self.config.num_label_classes),
-            label_targets.reshape(-1),
-            reduction="none",
-        ).view(labels_logits.shape[0], labels_logits.shape[1])
-        mp_label_mask, l_label_mask = self._mp_l_label_masks(batch, label_valid_mask)
-        mp_ce_loss = self._masked_ce_mean(per_step_ce, mp_label_mask)
-        l_ce_loss = self._masked_ce_mean(per_step_ce, l_label_mask)
-        weighted_label_ce_loss = (
-            self.config.mp_ce_weight * mp_ce_loss + self.config.l_ce_weight * l_ce_loss
+        targets = label_targets(batch, self.config.label_feature_key)
+        valid_labels = label_valid_mask(batch, self.config.label_feature_key)
+        weighted_label_ce_loss, label_loss_dict = segment_label_ce(
+            labels_logits,
+            targets,
+            valid_labels,
+            mp_ce_weight=self.config.mp_ce_weight,
+            l_ce_weight=self.config.l_ce_weight,
+            num_label_classes=self.config.num_label_classes,
         )
-
-        num_valid_labels = label_valid_mask.sum().clamp_min(1)
-        preds = labels_logits.argmax(dim=-1)
-        label_accuracy = ((preds == label_targets) & label_valid_mask).sum().float() / num_valid_labels
 
         loss_dict = {
             "mp_l1_loss": mp_l1_loss.item(),
             "l_l1_loss": l_l1_loss.item(),
             "weighted_l1_loss": weighted_l1_loss.item(),
-            "mp_ce_loss": mp_ce_loss.item(),
-            "l_ce_loss": l_ce_loss.item(),
-            "weighted_label_ce_loss": weighted_label_ce_loss.item(),
-            "label_accuracy": label_accuracy.item(),
+            **label_loss_dict,
         }
 
         if self.config.use_vae:
