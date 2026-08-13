@@ -44,20 +44,9 @@ from hybrid_eval.segment.rollout_wrapper import (
     HybridChunkTelemetry,
     HybridStepTelemetry,
     IkPending,
-    OmplPlanRetriesExhausted,
     SegmentRolloutWrapper,
 )
 from .configuration_act_segment import ACTSegmentConfig
-
-# Re-export hybrid telemetry types for callers that import from this module.
-__all__ = [
-    "ACTSegment",
-    "ACTSegmentPolicy",
-    "HybridChunkTelemetry",
-    "HybridStepTelemetry",
-    "IkPending",
-    "OmplPlanRetriesExhausted",
-]
 
 
 class ACTSegment(ACT):
