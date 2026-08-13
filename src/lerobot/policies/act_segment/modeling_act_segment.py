@@ -32,15 +32,15 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 
 from ..act.modeling_act import ACT, ACTPolicy, ACTTemporalEnsembler
 from ..pretrained import PreTrainedPolicy
-from ..segment.losses import (
+from hybrid_eval.segment.losses import (
     label_targets,
     label_valid_mask,
     masked_action_loss_mean,
     mp_l_action_masks,
     segment_label_ce,
 )
-from ..segment import rollout_wrapper as _segment_rollout_mod
-from ..segment.rollout_wrapper import (
+from hybrid_eval.segment import rollout_wrapper as _segment_rollout_mod
+from hybrid_eval.segment.rollout_wrapper import (
     HybridChunkTelemetry,
     HybridStepTelemetry,
     IkPending,

@@ -19,10 +19,11 @@
 
 from dataclasses import dataclass
 
+from hybrid_eval.segment.configuration_segment import SegmentPolicyConfigMixin
+
 from lerobot.configs import PreTrainedConfig
 
 from ..act.configuration_act import ACTConfig
-from ..segment.configuration_segment import SegmentPolicyConfigMixin
 
 
 @PreTrainedConfig.register_subclass("act_segment")
