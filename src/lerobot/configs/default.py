@@ -51,6 +51,9 @@ class DatasetConfig:
     # Last-L suffix augmentation (query-conditional MP→L fallback on trailing waypoint spans).
     enable_last_l_augmentation: bool = False
     last_l_n: int = 0
+    # Intermediate waypoint coverage (every interior MP frame as a real start).
+    # Mutually exclusive with MP-shift (mp_shift_max > 0).
+    enable_intermediate_waypoint_coverage: bool = False
 
     def __post_init__(self) -> None:
         if self.episodes is not None:
@@ -68,6 +71,11 @@ class DatasetConfig:
             )
         if self.last_l_n < 0:
             raise ValueError(f"last_l_n must be >= 0, got {self.last_l_n}")
+        if self.enable_intermediate_waypoint_coverage and self.mp_shift_max > 0:
+            raise ValueError(
+                "enable_intermediate_waypoint_coverage and MP-shift "
+                "(mp_shift_max > 0) are mutually exclusive"
+            )
 
 
 @dataclass
