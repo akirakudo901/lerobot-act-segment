@@ -389,7 +389,7 @@ class LiberoEnv(gym.Env):
         info = {"is_success": False}
         # Re-inject / re-bind after reset in case the underlying model was reloaded.
         if self._ompl_failure_viz_enabled:
-            from lerobot.envs.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
+            from hybrid_eval.planning.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
 
             enable_viz(self)
         return observation, info
@@ -587,7 +587,7 @@ class LiberoEnv(gym.Env):
         contact_dist_eps: float | None = None,
     ) -> dict[str, Any] | None:
         """Worker RPC shim: bind ``self`` as ``replay_env`` for Layer-1 OMPL."""
-        from lerobot.envs.hybrid_mp_planning import plan_ompl as plan_ompl_on_env
+        from hybrid_eval.planning.hybrid_mp_planning import plan_ompl as plan_ompl_on_env
 
         return plan_ompl_on_env(
             self,
@@ -625,7 +625,7 @@ class LiberoEnv(gym.Env):
         rot_scale: float = 0.5,
     ) -> dict[str, Any] | None:
         """Worker RPC shim for batched ``VectorEnv.call('plan_ompl_indexed', ...)``."""
-        from lerobot.envs.hybrid_mp_planning import plan_ompl_indexed as plan_ompl_indexed_on_env
+        from hybrid_eval.planning.hybrid_mp_planning import plan_ompl_indexed as plan_ompl_indexed_on_env
 
         return plan_ompl_indexed_on_env(
             self,
@@ -649,7 +649,7 @@ class LiberoEnv(gym.Env):
 
     def enable_ompl_failure_viz(self) -> None:
         """Inject mocap ghost / goal-marker bodies for OMPL failure stills (worker RPC)."""
-        from lerobot.envs.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
+        from hybrid_eval.planning.hybrid_mp_planning import enable_ompl_failure_viz as enable_viz
 
         self._ensure_env()
         enable_viz(self)
