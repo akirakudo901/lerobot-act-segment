@@ -53,6 +53,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 # see: https://github.com/akirakudo901/lerobot-act-segment
 
 import concurrent.futures as cf
+import gc
 import json
 import logging
 import threading
@@ -358,9 +359,12 @@ def rollout(
 
         # Hybrid-motion-planner extension (akirakudo901): record hybrid step info
         if live_recorder is not None:
+            records_env = getattr(live_recorder, "records_env", lambda _ix: True)
             pop_completed_chunks = getattr(policy, "pop_completed_chunks", None)
             if callable(pop_completed_chunks):
                 for chunk in pop_completed_chunks():
+                    if not records_env(chunk.row):
+                        continue
                     live_recorder.register_completed_chunk(
                         chunk.row,
                         anchor_step=chunk.anchor_step,
@@ -371,6 +375,8 @@ def rollout(
                 snapshot_chunk = getattr(policy, "_snapshot_chunk_output", None)
                 for env_ix, telemetry in enumerate(consume_telemetry()):
                     if telemetry is None or env_done_recorded[env_ix]:
+                        continue
+                    if not records_env(env_ix):
                         continue
                     chunk_output = None
                     if telemetry.is_new_chunk and callable(snapshot_chunk):
@@ -573,7 +579,17 @@ def eval_policy(
             ep_frames: list[np.ndarray] = []
 
         # Hybrid-motion-planner extension (akirakudo901)
-        live_recorder = LiveRolloutRecorder(env.num_envs) if use_hybrid_videos else None
+        n_hybrid_to_record = 0
+        if use_hybrid_videos:
+            n_hybrid_to_record = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+        live_recorder = (
+            LiveRolloutRecorder(
+                env.num_envs,
+                record_env_indices=range(n_hybrid_to_record),
+            )
+            if n_hybrid_to_record > 0
+            else None
+        )
 
         if start_seed is None:
             seeds = None
@@ -664,7 +680,11 @@ def eval_policy(
                     )
                 video_paths.append(str(video_path))
                 live_recorder.reset_episode(env_ix)
+                del segment_result
+                gc.collect()
                 n_episodes_rendered += 1
+            del live_recorder
+            gc.collect()
         # Normal video rendering
         elif max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
