@@ -63,15 +63,20 @@ def _maybe_wrap_mp_aug_ready_dataset(
             "(e.g. act_segment policy)."
         )
 
+    # Coverage follows the same train/val gate as MP-shift. last-L stays as configured.
+    enable_coverage = bool(dataset_cfg.enable_intermediate_waypoint_coverage) and (
+        enable_augmentation
+    )
     dataset_root = Path(dataset.root) if dataset.root is not None else None
     logging.info(
         "Wrapping augmentation-ready dataset at %s "
-        "(mp_shift_max=%d, augment=%s, last_l=%s n=%d)",
+        "(mp_shift_max=%d, augment=%s, last_l=%s n=%d, wp_cov=%s)",
         dataset_root,
         dataset_cfg.mp_shift_max,
         enable_augmentation,
         dataset_cfg.enable_last_l_augmentation,
         dataset_cfg.last_l_n,
+        enable_coverage,
     )
     return wrap_mp_aug_ready_dataset(
         dataset,
@@ -80,6 +85,7 @@ def _maybe_wrap_mp_aug_ready_dataset(
         enable_augmentation=enable_augmentation,
         enable_last_l_augmentation=bool(dataset_cfg.enable_last_l_augmentation),
         last_l_n=int(dataset_cfg.last_l_n),
+        enable_intermediate_waypoint_coverage=enable_coverage,
         rescale_mp_actions=dataset_cfg.rescale_mp_actions,
         rescaling_strategy=dataset_cfg.mp_rescaling_strategy,
         min_rescale_samples=dataset_cfg.mp_rescaling_min_samples,
@@ -246,7 +252,12 @@ def make_val_dataset(
     *,
     mp_aug_rescaling_registry_path: str | Path | None = None,
 ) -> LeRobotDataset | MultiLeRobotDataset:
-    """Build the offline validation dataset without image augmentations."""
+    """Build the offline validation dataset without image augmentations.
+
+    MP-shift and intermediate waypoint coverage are disabled (same
+    ``enable_mp_aug_ready_augmentation=False`` gate). last-L stays as configured
+    on the DatasetConfig.
+    """
     if cfg.val_dataset is not None:
         return make_dataset_from_config(
             cfg.val_dataset,
