@@ -623,6 +623,11 @@ class LiberoEnv(gym.Env):
         contact_dist_eps: float | None = None,
         pos_scale: float = 0.05,
         rot_scale: float = 0.5,
+        tracking_mode: str = "waypoint",
+        spline_dt: float = 0.05,
+        spline_max_ee_speed_m_s: float = 0.1,
+        spline_min_duration_s: float = 0.2,
+        spline_max_refine: int = 8,
     ) -> dict[str, Any] | None:
         """Worker RPC shim for batched ``VectorEnv.call('plan_ompl_indexed', ...)``."""
         from hybrid_eval.planning.hybrid_mp_planning import plan_ompl_indexed as plan_ompl_indexed_on_env
@@ -645,6 +650,11 @@ class LiberoEnv(gym.Env):
             contact_dist_eps=contact_dist_eps,
             pos_scale=pos_scale,
             rot_scale=rot_scale,
+            tracking_mode=tracking_mode,
+            spline_dt=spline_dt,
+            spline_max_ee_speed_m_s=spline_max_ee_speed_m_s,
+            spline_min_duration_s=spline_min_duration_s,
+            spline_max_refine=spline_max_refine,
         )
 
     def enable_ompl_failure_viz(self) -> None:

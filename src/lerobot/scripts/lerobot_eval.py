@@ -127,7 +127,13 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
 
 # Hybrid-motion-planner extension (akirakudo901)
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
-    """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills."""
+    """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills.
+
+    Layer-2 tracking (geometric waypoint OSC vs consecutive-MP timed spline) is
+    selected by ``policy.config.ompl_tracking_mode``. Pair
+    ``hybrid_connector=contiguous_mp_runs`` with ``ompl_tracking_mode=timed_spline``
+    so one cubic is fit over a contiguous B-MP/I-MP run.
+    """
     cfg = getattr(policy, "config", None)
     if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
         return
