@@ -129,10 +129,10 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
     """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills.
 
-    Layer-2 tracking (geometric waypoint OSC vs consecutive-MP timed spline) is
-    selected by ``policy.config.ompl_tracking_mode``. Pair
+    Layer-2 tracking (geometric waypoint OSC, consecutive-MP timed spline OSC, or
+    computed-torque) is selected by ``policy.config.ompl_tracking_mode``. Pair
     ``hybrid_connector=contiguous_mp_runs`` with ``ompl_tracking_mode=timed_spline``
-    so one cubic is fit over a contiguous B-MP/I-MP run.
+    or ``timed_spline_torque`` so one cubic is fit over a contiguous B-MP/I-MP run.
     """
     cfg = getattr(policy, "config", None)
     if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
@@ -229,6 +229,62 @@ def _attach_live_ee_poses_for_ompl(
     mask = [True] * int(env.num_envs)
     poses = hook.ee_poses_from_observation(observation, mask)
     observation["live_ee_pose"] = torch.as_tensor(np.stack(poses, axis=0), dtype=torch.float64)
+
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _attach_live_arm_dynamics_for_ompl(
+    policy: PreTrainedPolicy,
+    env: gym.vector.VectorEnv,
+    observation: dict[str, Any],
+) -> None:
+    """Attach physical arm q/qd/qdd/M for computed-torque MP (before policy normalize)."""
+    cfg = getattr(policy, "config", None)
+    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+        return
+    if str(getattr(cfg, "ompl_tracking_mode", "waypoint")) != "timed_spline_torque":
+        return
+    try:
+        snapshots = list(env.call("arm_dynamics_snapshot"))
+    except (AttributeError, NotImplementedError, TypeError):
+        return
+    if not snapshots:
+        return
+    observation["live_arm_qpos"] = torch.as_tensor(
+        np.stack([np.asarray(s["qpos"], dtype=np.float64) for s in snapshots], axis=0)
+    )
+    observation["live_arm_qvel"] = torch.as_tensor(
+        np.stack([np.asarray(s["qvel"], dtype=np.float64) for s in snapshots], axis=0)
+    )
+    observation["live_arm_qacc"] = torch.as_tensor(
+        np.stack([np.asarray(s["qacc"], dtype=np.float64) for s in snapshots], axis=0)
+    )
+    observation["live_arm_mass"] = torch.as_tensor(
+        np.stack([np.asarray(s["mass"], dtype=np.float64) for s in snapshots], axis=0)
+    )
+
+
+# Hybrid-motion-planner extension (akirakudo901)
+def _splice_ompl_torque_actions(policy: PreTrainedPolicy, action_numpy: np.ndarray) -> np.ndarray:
+    """Pad OSC actions to 8-D and overwrite MP rows with computed-torque commands."""
+    cfg = getattr(policy, "config", None)
+    consume = getattr(policy, "consume_ompl_torque_actions", None)
+    torque_rows = consume() if callable(consume) else []
+    torque_mode = (
+        cfg is not None
+        and getattr(cfg, "mp_executor_type", None) == "ompl_waypoints"
+        and str(getattr(cfg, "ompl_tracking_mode", "waypoint")) == "timed_spline_torque"
+    )
+    if not torque_mode:
+        return action_numpy
+    batch = int(action_numpy.shape[0])
+    padded = np.zeros((batch, 8), dtype=action_numpy.dtype)
+    src_dim = int(action_numpy.shape[1])
+    padded[:, :src_dim] = action_numpy
+    for row, tau in enumerate(torque_rows):
+        if tau is None:
+            continue
+        padded[row] = np.asarray(tau, dtype=action_numpy.dtype).reshape(8)
+    return padded
 
 # Hybrid-motion-planner extension (akirakudo901)
 def _policy_handles_rollout_postprocess(policy: PreTrainedPolicy) -> bool:
@@ -337,6 +393,7 @@ def rollout(
         # Hybrid-motion-planner extension (akirakudo901): physical EE for closed-loop OSC
         # Attach before policy preprocessor so live_ee_pose stays in physical units.
         _attach_live_ee_poses_for_ompl(policy, env, observation)
+        _attach_live_arm_dynamics_for_ompl(policy, env, observation)
 
         observation = preprocessor(observation)
         
@@ -366,6 +423,8 @@ def rollout(
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+        # Hybrid-motion-planner extension (akirakudo901): 8-D JOINT_TORQUE on MP rows
+        action_numpy = _splice_ompl_torque_actions(policy, action_numpy)
 
         # Hybrid-motion-planner extension (akirakudo901): record hybrid step info
         if live_recorder is not None:

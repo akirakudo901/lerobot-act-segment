@@ -220,6 +220,7 @@ class LiberoEnv(gym.Env):
         self.control_mode = control_mode
         # When True, Layer-1 OMPL soft failures capture blob/ghost PNG stills in-worker.
         self._ompl_failure_viz_enabled = False
+        self._saved_arm_controller = None
         images = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
@@ -364,6 +365,7 @@ class LiberoEnv(gym.Env):
 
     def reset(self, seed=None, **kwargs):
         self._ensure_env()
+        self._restore_arm_controller()
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
@@ -397,11 +399,8 @@ class LiberoEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
         self._ensure_env()
         assert self._env is not None
-        if action.ndim != 1:
-            raise ValueError(
-                f"Expected action to be 1-D (shape (action_dim,)), "
-                f"but got shape {action.shape} with ndim={action.ndim}"
-            )
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        action = self._action_for_current_controller(action)
         raw_obs, reward, done, info = self._env.step(action)
 
         is_success = self._env.check_success()
@@ -663,6 +662,96 @@ class LiberoEnv(gym.Env):
 
         self._ensure_env()
         enable_viz(self)
+
+    def _robosuite_sim_robot(self) -> tuple[Any, Any, Any]:
+        self._ensure_env()
+        assert self._env is not None
+        robots = getattr(self._env, "robots", None)
+        sim = getattr(self._env, "sim", None)
+        if not robots or sim is None:
+            raise RuntimeError("LIBERO OffScreenRenderEnv has no sim/robots for torque tracking")
+        return self._env, sim, robots[0]
+
+    def _controller_name(self) -> str:
+        _rs_env, _sim, robot = self._robosuite_sim_robot()
+        return str(getattr(robot.controller, "name", "") or "")
+
+    def _action_for_current_controller(self, action: np.ndarray) -> np.ndarray:
+        """Accept 7-D OSC or 8-D ``JOINT_TORQUE``; drop the pad dim on OSC rows."""
+        if action.ndim != 1:
+            raise ValueError(
+                f"Expected action to be 1-D (shape (action_dim,)), "
+                f"but got shape {action.shape} with ndim={action.ndim}"
+            )
+        name = self._controller_name()
+        if name == "JOINT_TORQUE":
+            if action.shape[0] != 8:
+                raise ValueError(
+                    f"JOINT_TORQUE expects an 8-D action [tau_in (7), gripper], got {action.shape}"
+                )
+            return action
+        if action.shape[0] == 8:
+            return action[:ACTION_DIM]
+        if action.shape[0] != ACTION_DIM:
+            raise ValueError(
+                f"Expected 1-D action of shape ({ACTION_DIM},) or (8,) for OSC, got {action.shape}"
+            )
+        return action
+
+    def arm_dynamics_snapshot(self) -> dict[str, np.ndarray]:
+        """Worker RPC: live arm q/qd/qdd and inertia for computed-torque Layer-2."""
+        from hybrid_eval.execution.libero_qpos import (
+            arm_mass_matrix,
+            get_arm_qacc,
+            get_arm_qpos,
+            get_arm_qvel,
+        )
+
+        _rs_env, sim, robot = self._robosuite_sim_robot()
+        sim.forward()
+        return {
+            "qpos": get_arm_qpos(sim, robot),
+            "qvel": get_arm_qvel(sim, robot),
+            "qacc": get_arm_qacc(sim, robot),
+            "mass": arm_mass_matrix(sim, robot),
+        }
+
+    def install_joint_torque_controller(self) -> None:
+        """Swap this worker's arm controller to identity-scaled ``JOINT_TORQUE``."""
+        from hybrid_eval.execution.libero_controller_swap import install_joint_torque_controller
+
+        if self._saved_arm_controller is not None:
+            return
+        rs_env, _sim, robot = self._robosuite_sim_robot()
+        self._saved_arm_controller = install_joint_torque_controller(rs_env, robot)
+
+    def _restore_arm_controller(self) -> None:
+        from hybrid_eval.execution.libero_controller_swap import restore_arm_controller
+
+        if self._saved_arm_controller is None or self._env is None:
+            self._saved_arm_controller = None
+            return
+        rs_env, _sim, robot = self._robosuite_sim_robot()
+        restore_arm_controller(rs_env, robot, self._saved_arm_controller)
+        self._saved_arm_controller = None
+
+    def restore_arm_controller(self) -> None:
+        """Restore the OSC controller saved by :meth:`install_joint_torque_controller`."""
+        self._restore_arm_controller()
+
+    def install_joint_torque_indexed(self, mask: Sequence[bool]) -> None:
+        """Worker RPC: install ``JOINT_TORQUE`` when ``mask[episode_index]``."""
+        idx = int(self.episode_index)
+        if idx < 0 or idx >= len(mask) or not mask[idx]:
+            return
+        self.install_joint_torque_controller()
+
+    def restore_arm_controller_indexed(self, mask: Sequence[bool]) -> None:
+        """Worker RPC: restore OSC when ``mask[episode_index]``."""
+        idx = int(self.episode_index)
+        if idx < 0 or idx >= len(mask) or not mask[idx]:
+            return
+        self.restore_arm_controller()
 
     def close(self):
         if self._env is not None:

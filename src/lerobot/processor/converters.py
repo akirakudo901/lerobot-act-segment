@@ -160,8 +160,12 @@ _COMPLEMENTARY_KEYS = (
     "task",
     # Hybrid-motion-planner extension (akirakudo901)
     "mp_rescale_key",
-    # Hybrid-motion-planner extension (akirakudo901)
     "live_ee_pose",  # physical EE (B, 6); must not be normalized with observation.state
+    "live_arm_qpos",  # physical arm qpos (B, 7) for timed_spline_torque
+    "live_arm_qvel",
+    "live_arm_qacc",
+    "live_arm_mass",  # physical arm inertia (B, 7, 7)
+    # Hybrid-motion-planner extension END (akirakudo901)
     "index",
     "task_index",
     "episode_index",

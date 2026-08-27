@@ -157,6 +157,10 @@ class ACTSegmentPolicy(ACTPolicy):
         """Return and clear IK targets from the last ``select_action`` call."""
         return self._segment_rollout.consume_ik_pending()
 
+    def consume_ompl_torque_actions(self) -> list[Any | None]:
+        """Return and clear 8-D ``JOINT_TORQUE`` actions from the last ``select_action``."""
+        return self._segment_rollout.consume_ompl_torque_actions()
+
     def consume_hybrid_step_telemetry(self) -> list[HybridStepTelemetry | None]:
         """Return and clear per-row telemetry from the last ``select_action`` call."""
         return self._segment_rollout.consume_hybrid_step_telemetry()
