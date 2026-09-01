@@ -723,40 +723,44 @@ def eval_policy(
 
         # Maybe render video for visualization.
         # Hybrid-motion-planner extension (akirakudo901)
-        if use_hybrid_videos and live_recorder is not None:
-            hybrid_videos_dir.mkdir(parents=True, exist_ok=True)
-            fps = int(env.unwrapped.metadata.get("render_fps", 10))
-            n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
-            for env_ix, done_index in enumerate(done_indices.flatten().tolist()[:n_to_render_now]):
-                if n_episodes_rendered >= max_episodes_rendered:
-                    break
-                segment_result = live_recorder.finalize_episode(
-                    env_ix,
-                    max_step=int(done_index) + 1,
-                )
-                video_path = hybrid_videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
-                render_segment_hybrid_rollout_video(
-                    segment_result,
-                    video_path,
-                    video_fps=fps,
-                    camera_scale=1,
-                    show_ground_truth=False,
-                    show_gt_segment_span=False,
-                    show_predicted_span_overlays=False,
-                    x_label="episode step",
-                )
-                if getattr(segment_result, "planning_failure", None) is not None:
-                    _write_ompl_plan_failure_artifacts(
-                        segment_result.planning_failure,
-                        video_path,
+        # Stay on this branch for the whole eval when hybrid videos are enabled.
+        # After max_episodes_rendered, later batches set live_recorder=None, avoiding wrong fall through
+        # to the normal path
+        if use_hybrid_videos:
+            if live_recorder is not None:
+                hybrid_videos_dir.mkdir(parents=True, exist_ok=True)
+                fps = int(env.unwrapped.metadata.get("render_fps", 10))
+                n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
+                for env_ix, done_index in enumerate(done_indices.flatten().tolist()[:n_to_render_now]):
+                    if n_episodes_rendered >= max_episodes_rendered:
+                        break
+                    segment_result = live_recorder.finalize_episode(
+                        env_ix,
+                        max_step=int(done_index) + 1,
                     )
-                video_paths.append(str(video_path))
-                live_recorder.reset_episode(env_ix)
-                del segment_result
+                    video_path = hybrid_videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
+                    render_segment_hybrid_rollout_video(
+                        segment_result,
+                        video_path,
+                        video_fps=fps,
+                        camera_scale=1,
+                        show_ground_truth=False,
+                        show_gt_segment_span=False,
+                        show_predicted_span_overlays=False,
+                        x_label="episode step",
+                    )
+                    if getattr(segment_result, "planning_failure", None) is not None:
+                        _write_ompl_plan_failure_artifacts(
+                            segment_result.planning_failure,
+                            video_path,
+                        )
+                    video_paths.append(str(video_path))
+                    live_recorder.reset_episode(env_ix)
+                    del segment_result
+                    gc.collect()
+                    n_episodes_rendered += 1
+                live_recorder = None
                 gc.collect()
-                n_episodes_rendered += 1
-            del live_recorder
-            gc.collect()
         # Normal video rendering
         elif max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
