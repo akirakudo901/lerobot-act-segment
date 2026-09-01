@@ -129,10 +129,13 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
     """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills.
 
-    Layer-2 tracking (geometric waypoint OSC, consecutive-MP timed spline OSC, or
-    computed-torque) is selected by ``policy.config.ompl_tracking_mode``. Pair
-    ``hybrid_connector=contiguous_mp_runs`` with ``ompl_tracking_mode=timed_spline``
-    or ``timed_spline_torque`` so one cubic is fit over a contiguous B-MP/I-MP run.
+    Layer-2 tracking is ``policy.config.ompl_tracking_mode``:
+    ``waypoint`` (OSC toward geometric samples), ``timed_spline`` (cubic + OSC),
+    or ``timed_spline_torque`` (same cubic, then 8-D ``JOINT_TORQUE``). Pair
+    ``hybrid_connector=contiguous_mp_runs`` with the spline modes so hops share
+    one cubic. Spline/torque knobs (``ompl_spline_*``, ``ompl_torque_kp/kd``,
+    ``ompl_goal_hold_frames``) are read from the policy config in
+    :class:`~hybrid_eval.segment.rollout_wrapper.SegmentRolloutWrapper`.
     """
     cfg = getattr(policy, "config", None)
     if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":

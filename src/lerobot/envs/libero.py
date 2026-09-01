@@ -584,6 +584,11 @@ class LiberoEnv(gym.Env):
         validity_checking_resolution: float = 0.03,
         simplify: bool = True,
         contact_dist_eps: float | None = None,
+        tracking_mode: str = "waypoint",
+        spline_dt: float = 0.05,
+        spline_max_ee_speed_m_s: float = 0.1,
+        spline_min_duration_s: float = 0.2,
+        spline_max_refine: int = 8,
     ) -> dict[str, Any] | None:
         """Worker RPC shim: bind ``self`` as ``replay_env`` for Layer-1 OMPL."""
         from hybrid_eval.planning.hybrid_mp_planning import plan_ompl as plan_ompl_on_env
@@ -602,6 +607,11 @@ class LiberoEnv(gym.Env):
             validity_checking_resolution=validity_checking_resolution,
             simplify=simplify,
             contact_dist_eps=contact_dist_eps,
+            tracking_mode=tracking_mode,
+            spline_dt=spline_dt,
+            spline_max_ee_speed_m_s=spline_max_ee_speed_m_s,
+            spline_min_duration_s=spline_min_duration_s,
+            spline_max_refine=spline_max_refine,
         )
 
     def plan_ompl_indexed(
