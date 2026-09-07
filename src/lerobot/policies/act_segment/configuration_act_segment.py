@@ -19,7 +19,10 @@
 
 from dataclasses import dataclass
 
-from hybrid_eval.segment.configuration_segment import SegmentPolicyConfigMixin
+from hybrid_eval.segment.configuration_segment import (
+    SegmentPolicyConfigMixin,
+    rewrite_legacy_ompl_cli_args,
+)
 
 from lerobot.configs import PreTrainedConfig
 
@@ -49,3 +52,24 @@ class ACTSegmentConfig(ACTConfig, SegmentPolicyConfigMixin):
     @property
     def label_delta_indices(self) -> list[int]:
         return list(range(self.chunk_size))
+
+
+def _patch_pretrained_ompl_cli_overrides() -> None:
+    """Rewrite legacy ``--ompl_*`` CLI overrides when loading a pretrained policy."""
+    orig = PreTrainedConfig.from_pretrained
+    if getattr(orig, "_ompl_cli_rewrite", False):
+        return
+    orig_func = orig.__func__
+
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **policy_kwargs):  # type: ignore[no-untyped-def]
+        overrides = policy_kwargs.get("cli_overrides")
+        if overrides:
+            policy_kwargs["cli_overrides"] = rewrite_legacy_ompl_cli_args(list(overrides))
+        return orig_func(cls, pretrained_name_or_path, **policy_kwargs)
+
+    from_pretrained._ompl_cli_rewrite = True  # type: ignore[attr-defined]
+    PreTrainedConfig.from_pretrained = from_pretrained
+
+
+_patch_pretrained_ompl_cli_overrides()

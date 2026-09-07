@@ -129,13 +129,13 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
     """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills.
 
-    Layer-2 tracking is ``policy.config.ompl_tracking_mode``:
+    Layer-2 tracking is ``policy.config.osc_tracker.tracking_mode``:
     ``waypoint`` (OSC toward geometric samples), ``timed_spline`` (cubic + OSC),
     or ``timed_spline_torque`` (same cubic, then 8-D ``JOINT_TORQUE``). Pair
     ``hybrid_connector=contiguous_mp_runs`` with the spline modes so hops share
-    one cubic. Spline/torque knobs (``ompl_spline_*``, ``ompl_torque_kp/kd``,
-    ``ompl_goal_hold_frames``) are read from the policy config in
-    :class:`~hybrid_eval.segment.rollout_wrapper.SegmentRolloutWrapper`.
+    one cubic. Nested ``OmplPathPlannerConfig`` / ``OscTrackerConfig`` on the
+    policy config are the source of truth (legacy flat ``ompl_*`` keys are
+    lifted at load time).
     """
     cfg = getattr(policy, "config", None)
     if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
@@ -151,6 +151,13 @@ def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.
         env.call("enable_ompl_failure_viz")
     except (AttributeError, NotImplementedError, TypeError):
         pass
+
+
+def _ompl_tracking_mode(cfg: Any) -> str:
+    tracker = getattr(cfg, "osc_tracker", None)
+    if tracker is not None:
+        return str(getattr(tracker, "tracking_mode", "waypoint"))
+    return str(getattr(cfg, "ompl_tracking_mode", "waypoint"))
 
 
 # Hybrid-motion-planner extension (akirakudo901)
@@ -244,7 +251,7 @@ def _attach_live_arm_dynamics_for_ompl(
     cfg = getattr(policy, "config", None)
     if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
         return
-    if str(getattr(cfg, "ompl_tracking_mode", "waypoint")) != "timed_spline_torque":
+    if _ompl_tracking_mode(cfg) != "timed_spline_torque":
         return
     try:
         snapshots = list(env.call("arm_dynamics_snapshot"))
@@ -275,7 +282,7 @@ def _splice_ompl_torque_actions(policy: PreTrainedPolicy, action_numpy: np.ndarr
     torque_mode = (
         cfg is not None
         and getattr(cfg, "mp_executor_type", None) == "ompl_waypoints"
-        and str(getattr(cfg, "ompl_tracking_mode", "waypoint")) == "timed_spline_torque"
+        and _ompl_tracking_mode(cfg) == "timed_spline_torque"
     )
     if not torque_mode:
         return action_numpy
