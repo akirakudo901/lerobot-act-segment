@@ -670,14 +670,28 @@ class LiberoEnv(gym.Env):
             "mass": arm_mass_matrix(sim, robot),
         }
 
-    def install_joint_torque_controller(self) -> None:
-        """Swap this worker's arm controller to identity-scaled ``JOINT_TORQUE``."""
+    def install_joint_torque_controller(
+        self,
+        *,
+        kp: float | np.ndarray | None = None,
+        kd: float | np.ndarray | None = None,
+    ) -> None:
+        """Swap this worker's arm controller to ``SplineComputedTorqueController``."""
         from hybrid_eval.execution.libero_controller_swap import install_joint_torque_controller
+        from hybrid_eval.execution.timed_spline_torque import (
+            DEFAULT_TORQUE_KD,
+            DEFAULT_TORQUE_KP,
+        )
 
         if self._saved_arm_controller is not None:
             return
         rs_env, _sim, robot = self._robosuite_sim_robot()
-        self._saved_arm_controller = install_joint_torque_controller(rs_env, robot)
+        kwargs: dict[str, Any] = {}
+        kwargs["kp"] = kp if kp is not None else DEFAULT_TORQUE_KP
+        kwargs["kd"] = kd if kd is not None else DEFAULT_TORQUE_KD
+        self._saved_arm_controller = install_joint_torque_controller(
+            rs_env, robot, **kwargs
+        )
 
     def _restore_arm_controller(self) -> None:
         from hybrid_eval.execution.libero_controller_swap import restore_arm_controller
@@ -693,12 +707,18 @@ class LiberoEnv(gym.Env):
         """Restore the OSC controller saved by :meth:`install_joint_torque_controller`."""
         self._restore_arm_controller()
 
-    def install_joint_torque_indexed(self, mask: Sequence[bool]) -> None:
-        """Worker RPC: install ``JOINT_TORQUE`` when ``mask[episode_index]``."""
+    def install_joint_torque_indexed(
+        self,
+        mask: Sequence[bool],
+        *,
+        kp: float | np.ndarray | None = None,
+        kd: float | np.ndarray | None = None,
+    ) -> None:
+        """Worker RPC: install ``SplineComputedTorqueController`` when ``mask[episode_index]``."""
         idx = int(self.episode_index)
         if idx < 0 or idx >= len(mask) or not mask[idx]:
             return
-        self.install_joint_torque_controller()
+        self.install_joint_torque_controller(kp=kp, kd=kd)
 
     def restore_arm_controller_indexed(self, mask: Sequence[bool]) -> None:
         """Worker RPC: restore OSC when ``mask[episode_index]``."""
@@ -706,6 +726,40 @@ class LiberoEnv(gym.Env):
         if idx < 0 or idx >= len(mask) or not mask[idx]:
             return
         self.restore_arm_controller()
+
+    def load_spline_indexed(
+        self,
+        plans: Sequence[Any | None],
+        mask: Sequence[bool],
+        *,
+        kp: float | np.ndarray | None = None,
+        kd: float | np.ndarray | None = None,
+    ) -> None:
+        """Worker RPC: rebuild the cubic and ``load_spline`` on the torque controller."""
+        from hybrid_eval.execution.waypoint_osc import execution_plan_from_mapping
+        from hybrid_eval.planning.joint_spline import spline_from_plan_knots
+
+        idx = int(self.episode_index)
+        if idx < 0 or idx >= len(mask) or not mask[idx]:
+            return
+        if idx >= len(plans) or plans[idx] is None:
+            return
+        mapping = plans[idx]
+        if not isinstance(mapping, dict):
+            return
+        _rs_env, _sim, robot = self._robosuite_sim_robot()
+        load = getattr(robot.controller, "load_spline", None)
+        if not callable(load):
+            raise RuntimeError(
+                "load_spline_indexed requires SplineComputedTorqueController; "
+                f"got {type(robot.controller).__name__}"
+            )
+        kwargs: dict[str, Any] = {}
+        if kp is not None:
+            kwargs["kp"] = kp
+        if kd is not None:
+            kwargs["kd"] = kd
+        load(spline_from_plan_knots(execution_plan_from_mapping(mapping)), **kwargs)
 
     def close(self):
         if self._env is not None:
