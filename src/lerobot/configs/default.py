@@ -54,6 +54,9 @@ class DatasetConfig:
     # Intermediate waypoint coverage (every interior MP frame as a real start).
     # Mutually exclusive with MP-shift (mp_shift_max > 0).
     enable_intermediate_waypoint_coverage: bool = False
+    # Dense-L: rewrite L-frame actions as EE pose-endpoint deltas at train time.
+    # Does not change stored parquet; combine with any augmentation-ready export.
+    relabel_l_as_pose_endpoint: bool = False
 
     def __post_init__(self) -> None:
         if self.episodes is not None:

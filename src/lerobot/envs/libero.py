@@ -127,8 +127,49 @@ def get_libero_dummy_action():
 
 
 ACTION_DIM = 7
+# robosuite JOINT_TORQUE / SplineComputedTorqueController: 7 arm + 1 gripper
+TORQUE_ACTION_DIM = 8
 ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
+
+
+def coerce_action_for_libero_controller(
+    action: np.ndarray,
+    *,
+    env_action_dim: int,
+    controller_name: str = "",
+) -> np.ndarray:
+    """Map a policy/vector-env action onto the live robosuite controller dim.
+
+    OSC is 7-D. Joint-torque swaps (including ``JOINT_TORQUE_SPLINE``) are 8-D
+    ``[arm (7), gripper]``. Do not key off the literal name ``JOINT_TORQUE``:
+    the spline controller uses ``JOINT_TORQUE_SPLINE`` and still expects 8.
+    """
+    if action.ndim != 1:
+        raise ValueError(
+            f"Expected action to be 1-D (shape (action_dim,)), "
+            f"but got shape {action.shape} with ndim={action.ndim}"
+        )
+    torque_mode = int(env_action_dim) == TORQUE_ACTION_DIM or str(controller_name).startswith(
+        "JOINT_TORQUE"
+    )
+    if torque_mode:
+        if action.shape[0] != TORQUE_ACTION_DIM:
+            raise ValueError(
+                f"{controller_name or 'joint-torque controller'} expects an 8-D action "
+                f"[arm (7), gripper], got {action.shape}"
+            )
+        return action
+    if action.shape[0] == TORQUE_ACTION_DIM:
+        return action[:ACTION_DIM]
+    if action.shape[0] != ACTION_DIM:
+        raise ValueError(
+            f"Expected 1-D action of shape ({ACTION_DIM},) or ({TORQUE_ACTION_DIM},) "
+            f"for OSC, got {action.shape}"
+        )
+        return action
+
+
 TASK_SUITE_MAX_STEPS: dict[str, int] = {
     "libero_spatial": 280,  # longest training demo has 193 steps
     "libero_object": 280,  # longest training demo has 254 steps
@@ -630,27 +671,20 @@ class LiberoEnv(gym.Env):
         _rs_env, _sim, robot = self._robosuite_sim_robot()
         return str(getattr(robot.controller, "name", "") or "")
 
+    def _robosuite_action_dim(self) -> int:
+        """Cached robosuite ``action_dim`` (7 OSC, 8 after joint-torque swap)."""
+        rs_env, _sim, robot = self._robosuite_sim_robot()
+        inner = getattr(rs_env, "env", None)
+        action_env = inner if inner is not None and hasattr(inner, "_action_dim") else rs_env
+        return int(getattr(action_env, "_action_dim", robot.action_dim))
+
     def _action_for_current_controller(self, action: np.ndarray) -> np.ndarray:
-        """Accept 7-D OSC or 8-D ``JOINT_TORQUE``; drop the pad dim on OSC rows."""
-        if action.ndim != 1:
-            raise ValueError(
-                f"Expected action to be 1-D (shape (action_dim,)), "
-                f"but got shape {action.shape} with ndim={action.ndim}"
-            )
-        name = self._controller_name()
-        if name == "JOINT_TORQUE":
-            if action.shape[0] != 8:
-                raise ValueError(
-                    f"JOINT_TORQUE expects an 8-D action [tau_in (7), gripper], got {action.shape}"
-                )
-            return action
-        if action.shape[0] == 8:
-            return action[:ACTION_DIM]
-        if action.shape[0] != ACTION_DIM:
-            raise ValueError(
-                f"Expected 1-D action of shape ({ACTION_DIM},) or (8,) for OSC, got {action.shape}"
-            )
-        return action
+        """Accept 7-D OSC or 8-D torque; drop the pad dim on OSC rows."""
+        return coerce_action_for_libero_controller(
+            action,
+            env_action_dim=self._robosuite_action_dim(),
+            controller_name=self._controller_name(),
+        )
 
     def arm_dynamics_snapshot(self) -> dict[str, np.ndarray]:
         """Worker RPC: live arm q/qd/qdd and inertia for computed-torque Layer-2."""
@@ -670,14 +704,28 @@ class LiberoEnv(gym.Env):
             "mass": arm_mass_matrix(sim, robot),
         }
 
-    def install_joint_torque_controller(self) -> None:
-        """Swap this worker's arm controller to identity-scaled ``JOINT_TORQUE``."""
+    def install_joint_torque_controller(
+        self,
+        *,
+        kp: float | np.ndarray | None = None,
+        kd: float | np.ndarray | None = None,
+    ) -> None:
+        """Swap this worker's arm controller to ``SplineComputedTorqueController``."""
         from hybrid_eval.execution.libero_controller_swap import install_joint_torque_controller
+        from hybrid_eval.execution.timed_spline_torque import (
+            DEFAULT_TORQUE_KD,
+            DEFAULT_TORQUE_KP,
+        )
 
         if self._saved_arm_controller is not None:
             return
         rs_env, _sim, robot = self._robosuite_sim_robot()
-        self._saved_arm_controller = install_joint_torque_controller(rs_env, robot)
+        kwargs: dict[str, Any] = {}
+        kwargs["kp"] = kp if kp is not None else DEFAULT_TORQUE_KP
+        kwargs["kd"] = kd if kd is not None else DEFAULT_TORQUE_KD
+        self._saved_arm_controller = install_joint_torque_controller(
+            rs_env, robot, **kwargs
+        )
 
     def _restore_arm_controller(self) -> None:
         from hybrid_eval.execution.libero_controller_swap import restore_arm_controller
@@ -693,12 +741,18 @@ class LiberoEnv(gym.Env):
         """Restore the OSC controller saved by :meth:`install_joint_torque_controller`."""
         self._restore_arm_controller()
 
-    def install_joint_torque_indexed(self, mask: Sequence[bool]) -> None:
-        """Worker RPC: install ``JOINT_TORQUE`` when ``mask[episode_index]``."""
+    def install_joint_torque_indexed(
+        self,
+        mask: Sequence[bool],
+        *,
+        kp: float | np.ndarray | None = None,
+        kd: float | np.ndarray | None = None,
+    ) -> None:
+        """Worker RPC: install ``SplineComputedTorqueController`` when ``mask[episode_index]``."""
         idx = int(self.episode_index)
         if idx < 0 or idx >= len(mask) or not mask[idx]:
             return
-        self.install_joint_torque_controller()
+        self.install_joint_torque_controller(kp=kp, kd=kd)
 
     def restore_arm_controller_indexed(self, mask: Sequence[bool]) -> None:
         """Worker RPC: restore OSC when ``mask[episode_index]``."""
@@ -706,6 +760,40 @@ class LiberoEnv(gym.Env):
         if idx < 0 or idx >= len(mask) or not mask[idx]:
             return
         self.restore_arm_controller()
+
+    def load_spline_indexed(
+        self,
+        plans: Sequence[Any | None],
+        mask: Sequence[bool],
+        *,
+        kp: float | np.ndarray | None = None,
+        kd: float | np.ndarray | None = None,
+    ) -> None:
+        """Worker RPC: rebuild the cubic and ``load_spline`` on the torque controller."""
+        from hybrid_eval.execution.waypoint_osc import execution_plan_from_mapping
+        from hybrid_eval.planning.joint_spline import spline_from_plan_knots
+
+        idx = int(self.episode_index)
+        if idx < 0 or idx >= len(mask) or not mask[idx]:
+            return
+        if idx >= len(plans) or plans[idx] is None:
+            return
+        mapping = plans[idx]
+        if not isinstance(mapping, dict):
+            return
+        _rs_env, _sim, robot = self._robosuite_sim_robot()
+        load = getattr(robot.controller, "load_spline", None)
+        if not callable(load):
+            raise RuntimeError(
+                "load_spline_indexed requires SplineComputedTorqueController; "
+                f"got {type(robot.controller).__name__}"
+            )
+        kwargs: dict[str, Any] = {}
+        if kp is not None:
+            kwargs["kp"] = kp
+        if kd is not None:
+            kwargs["kd"] = kd
+        load(spline_from_plan_knots(execution_plan_from_mapping(mapping)), **kwargs)
 
     def close(self):
         if self._env is not None:
