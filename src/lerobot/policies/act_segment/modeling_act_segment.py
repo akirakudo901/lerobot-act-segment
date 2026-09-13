@@ -161,6 +161,14 @@ class ACTSegmentPolicy(ACTPolicy):
         """Return and clear 8-D ``JOINT_TORQUE`` actions from the last ``select_action``."""
         return self._segment_rollout.consume_ompl_torque_actions()
 
+    def set_collect_tracker_traces(self, rows: Sequence[int] | None) -> None:
+        """Enable Layer-2 tracker traces for VectorEnv rows (eval spline/waypoint viz)."""
+        self._segment_rollout.set_collect_tracker_traces(rows)
+
+    def consume_ompl_tracker_traces(self) -> list[list[Any]]:
+        """Return and clear per-row Layer-2 tracker traces from the last episode."""
+        return self._segment_rollout.consume_ompl_tracker_traces()
+
     def consume_hybrid_step_telemetry(self) -> list[HybridStepTelemetry | None]:
         """Return and clear per-row telemetry from the last ``select_action`` call."""
         return self._segment_rollout.consume_hybrid_step_telemetry()

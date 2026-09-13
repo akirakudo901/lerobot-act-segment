@@ -233,6 +233,32 @@ def _write_ompl_plan_failure_artifacts(failure: Any, video_path: Path) -> list[P
     return [failure_path, *written.values()]
 
 
+def _set_collect_tracker_traces(policy: PreTrainedPolicy, rows: Any) -> None:
+    """Enable Layer-2 tracker traces for selected VectorEnv rows (or disable)."""
+    setter = getattr(policy, "set_collect_tracker_traces", None)
+    if callable(setter):
+        setter(rows)
+
+
+def _consume_ompl_tracker_traces(policy: PreTrainedPolicy) -> list[list[Any]]:
+    consume = getattr(policy, "consume_ompl_tracker_traces", None)
+    if not callable(consume):
+        return []
+    traces = consume()
+    if not isinstance(traces, list):
+        return []
+    return traces
+
+
+def _write_eval_tracker_trace_figures(traces: list[Any], out_dir: Path) -> list[Path]:
+    """Write GT-free live-vs-spline/waypoint figures for one eval episode."""
+    if not traces:
+        return []
+    from hybrid_eval.visualize.timed_spline_plots import render_live_tracker_trace_figures
+
+    return render_live_tracker_trace_figures(traces, out_dir)
+
+
 
 # Hybrid-motion-planner extension (akirakudo901)
 def _attach_live_ee_poses_for_ompl(
@@ -679,6 +705,21 @@ def eval_policy(
             else None
         )
 
+        n_tracker_trace_rows = 0
+        cfg = getattr(policy, "config", None)
+        if (
+            max_episodes_rendered > 0
+            and cfg is not None
+            and _uses_ompl_layer1_rpc(cfg)
+        ):
+            n_tracker_trace_rows = min(
+                max_episodes_rendered - n_episodes_rendered, env.num_envs
+            )
+        _set_collect_tracker_traces(
+            policy,
+            range(n_tracker_trace_rows) if n_tracker_trace_rows > 0 else None,
+        )
+
         if start_seed is None:
             seeds = None
         else:
@@ -737,6 +778,10 @@ def eval_policy(
                 # Concatenate the episode data.
                 episode_data = {k: torch.cat([episode_data[k], this_episode_data[k]]) for k in episode_data}
 
+        traces_by_row = (
+            _consume_ompl_tracker_traces(policy) if n_tracker_trace_rows > 0 else []
+        )
+
         # Maybe render video for visualization.
         # Hybrid-motion-planner extension (akirakudo901)
         # Stay on this branch for the whole eval when hybrid videos are enabled.
@@ -770,6 +815,10 @@ def eval_policy(
                             segment_result.planning_failure,
                             video_path,
                         )
+                    _write_eval_tracker_trace_figures(
+                        traces_by_row[env_ix] if env_ix < len(traces_by_row) else [],
+                        hybrid_videos_dir / f"eval_episode_{n_episodes_rendered}",
+                    )
                     video_paths.append(str(video_path))
                     live_recorder.reset_episode(env_ix)
                     del segment_result
@@ -780,8 +829,10 @@ def eval_policy(
         # Normal video rendering
         elif max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
-            for stacked_frames, done_index in zip(
-                batch_stacked_frames, done_indices.flatten().tolist(), strict=False
+            for env_ix, (stacked_frames, done_index) in enumerate(
+                zip(
+                    batch_stacked_frames, done_indices.flatten().tolist(), strict=False
+                )
             ):
                 if n_episodes_rendered >= max_episodes_rendered:
                     break
@@ -799,6 +850,10 @@ def eval_policy(
                 )
                 thread.start()
                 threads.append(thread)
+                _write_eval_tracker_trace_figures(
+                    traces_by_row[env_ix] if env_ix < len(traces_by_row) else [],
+                    videos_dir / f"eval_episode_{n_episodes_rendered}",
+                )
                 n_episodes_rendered += 1
 
         progbar.set_postfix(
