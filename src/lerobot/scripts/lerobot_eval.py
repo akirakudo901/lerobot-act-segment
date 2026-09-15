@@ -125,6 +125,21 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
         set_processors(postprocessor)
 
 
+def _l_spline_torque_enabled(cfg: Any) -> bool:
+    return str(getattr(cfg, "l_executor_type", "policy")) == "timed_spline_torque"
+
+
+def _uses_ompl_layer1_rpc(cfg: Any) -> bool:
+    return (
+        getattr(cfg, "mp_executor_type", None) == "ompl_waypoints"
+        or _l_spline_torque_enabled(cfg)
+    )
+
+
+def _uses_spline_torque_eval(cfg: Any) -> bool:
+    return _uses_ompl_layer1_rpc(cfg) and _ompl_tracking_mode(cfg) == "timed_spline_torque"
+
+
 # Hybrid-motion-planner extension (akirakudo901)
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
     """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills.
@@ -135,10 +150,10 @@ def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.
     ``hybrid_connector=contiguous_mp_runs`` with the spline modes so hops share
     one cubic. Nested ``OmplPathPlannerConfig`` / ``OscTrackerConfig`` on the
     policy config are the source of truth (legacy flat ``ompl_*`` keys are
-    lifted at load time).
+    lifted at load time). Also binds when ``l_executor_type='timed_spline_torque'``.
     """
     cfg = getattr(policy, "config", None)
-    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+    if cfg is None or not _uses_ompl_layer1_rpc(cfg):
         return
 
     bind = getattr(policy, "bind_eval_env", None)
@@ -231,7 +246,7 @@ def _attach_live_ee_poses_for_ompl(
     preserves it and does not treat it as normalized ``observation.state``.
     """
     cfg = getattr(policy, "config", None)
-    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
+    if cfg is None or not _uses_ompl_layer1_rpc(cfg):
         return
     hook = _ik_obs_hook_class(env)
     if hook is None:
@@ -249,9 +264,7 @@ def _attach_live_arm_dynamics_for_ompl(
 ) -> None:
     """Attach physical arm q/qd/qdd/M for computed-torque MP (before policy normalize)."""
     cfg = getattr(policy, "config", None)
-    if cfg is None or getattr(cfg, "mp_executor_type", None) != "ompl_waypoints":
-        return
-    if _ompl_tracking_mode(cfg) != "timed_spline_torque":
+    if cfg is None or not _uses_spline_torque_eval(cfg):
         return
     try:
         snapshots = list(env.call("arm_dynamics_snapshot"))
@@ -279,11 +292,7 @@ def _splice_ompl_torque_actions(policy: PreTrainedPolicy, action_numpy: np.ndarr
     cfg = getattr(policy, "config", None)
     consume = getattr(policy, "consume_ompl_torque_actions", None)
     torque_rows = consume() if callable(consume) else []
-    torque_mode = (
-        cfg is not None
-        and getattr(cfg, "mp_executor_type", None) == "ompl_waypoints"
-        and _ompl_tracking_mode(cfg) == "timed_spline_torque"
-    )
+    torque_mode = cfg is not None and _uses_spline_torque_eval(cfg)
     if not torque_mode:
         return action_numpy
     batch = int(action_numpy.shape[0])
