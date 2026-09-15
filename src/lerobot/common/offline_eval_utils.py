@@ -101,6 +101,43 @@ def resolve_train_val_episodes(
     return episode_pool, None
 
 
+def relative_episode_spans(dataset: "LeRobotDataset") -> tuple[list[int], list[int]]:
+    """Episode start/end indices for :class:`~lerobot.datasets.sampler.EpisodeAwareSampler`.
+
+    ``LeRobotDataset.__getitem__`` takes a *relative* row index into the loaded
+    HF table, while ``meta.episodes["dataset_from_index"]`` /
+    ``dataset_to_index`` are *absolute* frame ids from the full dataset.
+    After a train/val episode split the table is compacted, so the sampler
+    must use these remapped spans or it will request out-of-range keys.
+
+    Unloaded episodes keep a zero-length ``(0, 0)`` placeholder so the lists
+    stay aligned with original episode indices 0..N-1.
+    """
+    from_abs = [int(x) for x in dataset.meta.episodes["dataset_from_index"]]
+    to_abs = [int(x) for x in dataset.meta.episodes["dataset_to_index"]]
+    if dataset.episodes is None:
+        return from_abs, to_abs
+
+    reader = dataset._ensure_reader()
+    if reader.hf_dataset is None:
+        reader.load_and_activate()
+    mapping = reader._absolute_to_relative_idx
+    if mapping is None:
+        return from_abs, to_abs
+
+    rel_from: list[int] = []
+    rel_to: list[int] = []
+    for start, end in zip(from_abs, to_abs, strict=True):
+        last = end - 1
+        if start not in mapping or last not in mapping:
+            rel_from.append(0)
+            rel_to.append(0)
+            continue
+        rel_from.append(mapping[start])
+        rel_to.append(mapping[last] + 1)
+    return rel_from, rel_to
+
+
 def compute_offline_val_loss(
     policy: PreTrainedPolicy,
     val_dataloader: DataLoader,

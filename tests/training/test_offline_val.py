@@ -38,6 +38,7 @@ from lerobot.common.offline_eval_utils import (
     compute_offline_val_segment_loss,
     episode_pattern,
     local_frame_to_span_idx,
+    relative_episode_spans,
     split_episode_indices,
 )
 from lerobot.configs.default import DatasetConfig
@@ -104,6 +105,55 @@ def test_split_episode_indices():
     train_one, val_one = split_episode_indices([0], fraction=0.5, seed=0)
     assert train_one == [0]
     assert val_one == []
+
+
+def test_relative_episode_spans_identity_without_filter(tmp_path):
+    _dataset, root = make_dummy_dataset(["camera1"], tmp_path, n_episodes=3)
+    dataset = LeRobotDataset(DUMMY_REPO_ID, root=root)
+    rel_from, rel_to = relative_episode_spans(dataset)
+    abs_from = [int(x) for x in dataset.meta.episodes["dataset_from_index"]]
+    abs_to = [int(x) for x in dataset.meta.episodes["dataset_to_index"]]
+    assert rel_from == abs_from
+    assert rel_to == abs_to
+    assert rel_to[-1] == len(dataset)
+
+
+def test_relative_episode_spans_for_episode_subset(tmp_path):
+    _dataset, root = make_dummy_dataset(["camera1"], tmp_path, n_episodes=5)
+    dataset = LeRobotDataset(DUMMY_REPO_ID, root=root, episodes=[0, 2])
+    rel_from, rel_to = relative_episode_spans(dataset)
+    abs_from = [int(x) for x in dataset.meta.episodes["dataset_from_index"]]
+    abs_to = [int(x) for x in dataset.meta.episodes["dataset_to_index"]]
+
+    assert rel_from != abs_from or rel_to != abs_to
+    assert rel_from[0] == 0
+    assert rel_to[0] == abs_to[0] - abs_from[0]
+    ep2_len = abs_to[2] - abs_from[2]
+    assert rel_from[2] == rel_to[0]
+    assert rel_to[2] == rel_from[2] + ep2_len
+    assert rel_to[2] == len(dataset)
+    for ep_idx in (1, 3, 4):
+        assert rel_from[ep_idx] == 0
+        assert rel_to[ep_idx] == 0
+
+    from lerobot.datasets.sampler import EpisodeAwareSampler
+
+    sampler = EpisodeAwareSampler(
+        rel_from,
+        rel_to,
+        episode_indices_to_use=dataset.episodes,
+        drop_n_last_frames=1,
+        shuffle=False,
+    )
+    assert max(sampler.indices, default=-1) < len(dataset)
+    abs_sampler = EpisodeAwareSampler(
+        abs_from,
+        abs_to,
+        episode_indices_to_use=dataset.episodes,
+        drop_n_last_frames=1,
+        shuffle=False,
+    )
+    assert max(abs_sampler.indices) >= len(dataset)
 
 
 def test_assert_no_episode_overlap():
