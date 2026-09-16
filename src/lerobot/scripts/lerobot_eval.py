@@ -233,6 +233,17 @@ def _write_ompl_plan_failure_artifacts(failure: Any, video_path: Path) -> list[P
     return [failure_path, *written.values()]
 
 
+def _snapshot_ompl_episode_failures(policy: PreTrainedPolicy, n_envs: int) -> list[Any | None]:
+    """Per-env OMPL failure payloads for the episode that just finished (or Nones)."""
+    snap = getattr(policy, "snapshot_ompl_episode_failures", None)
+    if not callable(snap):
+        return [None] * n_envs
+    rows = list(snap() or [])
+    if len(rows) < n_envs:
+        rows.extend([None] * (n_envs - len(rows)))
+    return rows[:n_envs]
+
+
 def _set_collect_tracker_traces(policy: PreTrainedPolicy, rows: Any) -> None:
     """Enable Layer-2 tracker traces for selected VectorEnv rows (or disable)."""
     setter = getattr(policy, "set_collect_tracker_traces", None)
@@ -596,6 +607,9 @@ def rollout(
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
 
+    # Hybrid-motion-planner extension (akirakudo901): failure modes for every env row
+    ret["ompl_plan_failures"] = _snapshot_ompl_episode_failures(policy, env.num_envs)
+
     return ret
 
 
@@ -661,6 +675,7 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_planning_records: list[dict[str, Any]] = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -757,8 +772,16 @@ def eval_policy(
         all_successes.extend(batch_successes.tolist())
         if seeds:
             all_seeds.extend(seeds)
-        else:
-            all_seeds.append(None)
+        # Hybrid-motion-planner extension (akirakudo901)
+        from hybrid_eval.planning.ompl_failure_modes import planning_records_for_batch
+
+        batch_success_list = batch_successes.tolist()
+        all_planning_records.extend(
+            planning_records_for_batch(
+                rollout_data.get("ompl_plan_failures") or [None] * len(batch_success_list),
+                batch_success_list,
+            )
+        )
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -865,31 +888,59 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
-    info = {
-        "per_episode": [
+    planning_records = all_planning_records[:n_episodes]
+    while len(planning_records) < n_episodes:
+        idx = len(planning_records)
+        planning_records.append(
             {
-                "episode_ix": i,
-                "sum_reward": sum_reward,
-                "max_reward": max_reward,
-                "success": success,
-                "seed": seed,
+                "planning_failure": False,
+                "planning_failure_status": None,
+                "planning_failure_mode": None,
+                "planning_failure_attempts": None,
+                "failure_kind": "none" if all_successes[idx] else "non_ompl",
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
-                zip(
-                    sum_rewards[:n_episodes],
-                    max_rewards[:n_episodes],
-                    all_successes[:n_episodes],
-                    all_seeds[:n_episodes],
-                    strict=True,
-                )
-            )
-        ],
+        )
+    seeds_for_info = all_seeds[:n_episodes] if all_seeds else [None] * n_episodes
+    per_episode = []
+    for i, (sum_reward, max_reward, success, seed, plan_rec) in enumerate(
+        zip(
+            sum_rewards[:n_episodes],
+            max_rewards[:n_episodes],
+            all_successes[:n_episodes],
+            seeds_for_info,
+            planning_records,
+            strict=True,
+        )
+    ):
+        rec = {
+            "episode_ix": i,
+            "sum_reward": sum_reward,
+            "max_reward": max_reward,
+            "success": bool(success),
+            "seed": seed,
+            **plan_rec,
+        }
+        rec["success"] = bool(success)
+        rec["episode_ix"] = i
+        per_episode.append(rec)
+
+    from hybrid_eval.planning.ompl_failure_modes import (
+        aggregate_ompl_failure_stats,
+        ompl_failure_episode_entries,
+    )
+
+    ompl_stats = aggregate_ompl_failure_stats(per_episode, n=n_episodes)
+
+    info = {
+        "per_episode": per_episode,
         "aggregated": {
             "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
             "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
             "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
             "eval_s": time.time() - start,
             "eval_ep_s": (time.time() - start) / n_episodes,
+            **ompl_stats,
+            "ompl_failure_episodes": ompl_failure_episode_entries(per_episode),
         },
     }
 
@@ -1032,9 +1083,56 @@ class TaskMetrics(TypedDict):
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    planning_failures: list[bool]
+    planning_failure_modes: list[str | None]
+    planning_failure_statuses: list[str | None]
+    planning_failure_attempts: list[int | None]
+    failure_kinds: list[str]
+    ompl_failure_episodes: list[dict]
 
 
-ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
+ACC_KEYS = (
+    "sum_rewards",
+    "max_rewards",
+    "successes",
+    "video_paths",
+    "planning_records",
+)
+
+
+def _planning_records_from_task_metrics(
+    *,
+    task_group: str,
+    task_id: Any,
+    metrics: dict,
+) -> list[dict[str, Any]]:
+    """Rebuild per-episode planning records from TaskMetrics parallel lists."""
+    successes = list(metrics.get("successes") or [])
+    n = len(successes)
+    failures = list(metrics.get("planning_failures") or [False] * n)
+    modes = list(metrics.get("planning_failure_modes") or [None] * n)
+    statuses = list(metrics.get("planning_failure_statuses") or [None] * n)
+    attempts = list(metrics.get("planning_failure_attempts") or [None] * n)
+    kinds = list(metrics.get("failure_kinds") or ["none"] * n)
+    records: list[dict[str, Any]] = []
+    for i in range(n):
+        success = bool(successes[i])
+        planning_failure = bool(failures[i]) if i < len(failures) else False
+        kind = str(kinds[i]) if i < len(kinds) else ("ompl" if planning_failure else ("none" if success else "non_ompl"))
+        records.append(
+            {
+                "task_group": task_group,
+                "task_id": task_id,
+                "episode_ix": i,
+                "success": success,
+                "planning_failure": planning_failure,
+                "planning_failure_mode": modes[i] if i < len(modes) else None,
+                "planning_failure_status": statuses[i] if i < len(statuses) else None,
+                "planning_failure_attempts": attempts[i] if i < len(attempts) else None,
+                "failure_kind": kind,
+            }
+        )
+    return records
 
 
 def eval_one(
@@ -1072,12 +1170,25 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
-    return TaskMetrics(
+    from hybrid_eval.planning.ompl_failure_modes import (
+        aggregate_ompl_failure_stats,
+        ompl_failure_episode_entries,
+    )
+
+    metrics = TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
+        planning_failures=[bool(ep.get("planning_failure")) for ep in per_episode],
+        planning_failure_modes=[ep.get("planning_failure_mode") for ep in per_episode],
+        planning_failure_statuses=[ep.get("planning_failure_status") for ep in per_episode],
+        planning_failure_attempts=[ep.get("planning_failure_attempts") for ep in per_episode],
+        failure_kinds=[str(ep.get("failure_kind") or "none") for ep in per_episode],
+        ompl_failure_episodes=ompl_failure_episode_entries(per_episode),
     )
+    metrics.update(aggregate_ompl_failure_stats(per_episode, n=len(per_episode)))
+    return metrics
 
 
 def run_one(
@@ -1170,7 +1281,7 @@ def eval_policy_all(
     per_task_infos: list[dict] = []
 
     # small inline helper to accumulate one task's metrics into accumulators
-    def _accumulate_to(group: str, metrics: dict):
+    def _accumulate_to(group: str, task_id: Any, metrics: dict):
         # metrics expected to contain 'sum_rewards', 'max_rewards', 'successes', optionally 'video_paths'
         # but eval_one may store per-episode lists; we assume metrics uses scalars averaged per task as before.
         # To be robust, accept scalars or lists.
@@ -1192,6 +1303,13 @@ def eval_policy_all(
         if paths:
             group_acc[group]["video_paths"].extend(paths)
             overall["video_paths"].extend(paths)
+
+        planning_records = _planning_records_from_task_metrics(
+            task_group=group, task_id=task_id, metrics=metrics
+        )
+        if planning_records:
+            group_acc[group]["planning_records"].extend(planning_records)
+            overall["planning_records"].extend(planning_records)
 
     # Choose runner (sequential vs threaded)
     task_runner = partial(
@@ -1219,7 +1337,7 @@ def eval_policy_all(
 
             try:
                 tg, tid, metrics = task_runner(task_group, task_id, env)
-                _accumulate_to(tg, metrics)
+                _accumulate_to(tg, tid, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
             finally:
                 env.close()
@@ -1240,7 +1358,7 @@ def eval_policy_all(
                 tg, tid, env = fut2meta[fut]
                 try:
                     tg, tid, metrics = fut.result()
-                    _accumulate_to(tg, metrics)
+                    _accumulate_to(tg, tid, metrics)
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                 finally:
                     env.close()
@@ -1252,27 +1370,44 @@ def eval_policy_all(
         arr = np.array(xs, dtype=float)
         return float(np.nanmean(arr))
 
+    from hybrid_eval.planning.ompl_failure_modes import (
+        aggregate_ompl_failure_stats,
+        ompl_failure_episode_entries,
+    )
+
+    def _with_ompl_stats(base: dict, records: list[dict]) -> dict:
+        stats = aggregate_ompl_failure_stats(records, n=len(records) if records else base.get("n_episodes"))
+        out = {**base, **stats}
+        out["ompl_failure_episodes"] = ompl_failure_episode_entries(records)
+        return out
+
     # compute per-group aggregates
     groups_aggregated = {}
     for group, acc in group_acc.items():
-        groups_aggregated[group] = {
-            "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
-            "avg_max_reward": _agg_from_list(acc["max_rewards"]),
-            "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
-            "n_episodes": len(acc["sum_rewards"]),
-            "video_paths": list(acc["video_paths"]),
-        }
+        groups_aggregated[group] = _with_ompl_stats(
+            {
+                "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
+                "avg_max_reward": _agg_from_list(acc["max_rewards"]),
+                "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
+                "n_episodes": len(acc["sum_rewards"]),
+                "video_paths": list(acc["video_paths"]),
+            },
+            list(acc.get("planning_records") or []),
+        )
 
     # overall aggregates
-    overall_agg = {
-        "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
-        "avg_max_reward": _agg_from_list(overall["max_rewards"]),
-        "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
-        "n_episodes": len(overall["sum_rewards"]),
-        "eval_s": time.time() - start_t,
-        "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
-        "video_paths": list(overall["video_paths"]),
-    }
+    overall_agg = _with_ompl_stats(
+        {
+            "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
+            "avg_max_reward": _agg_from_list(overall["max_rewards"]),
+            "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
+            "n_episodes": len(overall["sum_rewards"]),
+            "eval_s": time.time() - start_t,
+            "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
+            "video_paths": list(overall["video_paths"]),
+        },
+        list(overall.get("planning_records") or []),
+    )
 
     return {
         "per_task": per_task_infos,

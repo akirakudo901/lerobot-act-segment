@@ -126,18 +126,60 @@ def _aggregate_episode_metrics(values: dict) -> dict[str, float | int]:
     if isinstance(max_rewards, list) and max_rewards:
         aggregated["avg_max_reward"] = float(sum(max_rewards) / len(max_rewards))
         aggregated.setdefault("n_episodes", len(max_rewards))
+    for key in (
+        "n_ompl_failures",
+        "n_non_ompl_failures",
+        "ompl_failure_rate",
+        "pc_ompl_failure",
+        "pc_non_ompl_failure",
+    ):
+        value = values.get(key)
+        if isinstance(value, (int, float)) and not (isinstance(value, float) and math.isnan(value)):
+            aggregated[key] = value
     return aggregated
+
+
+def _sanitize_failure_mode_key(mode: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in str(mode))
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_")
 
 
 def flatten_eval_metrics(eval_info: dict) -> dict[str, float | int]:
     """Flatten eval_info.json into scalar metrics suitable for WandB logging."""
     metrics: dict[str, float | int] = {}
+    scalar_keys = (
+        "pc_success",
+        "avg_sum_reward",
+        "avg_max_reward",
+        "n_episodes",
+        "eval_s",
+        "eval_ep_s",
+        "n_ompl_failures",
+        "n_non_ompl_failures",
+        "ompl_failure_rate",
+        "pc_ompl_failure",
+        "pc_non_ompl_failure",
+    )
 
     def _add(prefix: str, values: dict) -> None:
-        for key in ("pc_success", "avg_sum_reward", "avg_max_reward", "n_episodes", "eval_s", "eval_ep_s"):
+        for key in scalar_keys:
             value = values.get(key)
             if isinstance(value, (int, float)) and not (isinstance(value, float) and math.isnan(value)):
                 metrics[f"{prefix}{key}"] = value
+        counts = values.get("ompl_failure_counts")
+        pcs = values.get("ompl_failure_pc") if isinstance(values.get("ompl_failure_pc"), dict) else {}
+        if isinstance(counts, dict):
+            for mode, count in counts.items():
+                safe = _sanitize_failure_mode_key(mode)
+                if isinstance(count, (int, float)) and not (
+                    isinstance(count, float) and math.isnan(count)
+                ):
+                    metrics[f"{prefix}ompl_failure/{safe}/n"] = count
+                pc = pcs.get(mode)
+                if isinstance(pc, (int, float)) and not (isinstance(pc, float) and math.isnan(pc)):
+                    metrics[f"{prefix}ompl_failure/{safe}/pc"] = pc
 
     overall = eval_info.get("overall")
     if isinstance(overall, dict):
@@ -467,6 +509,10 @@ def main(argv: list[str] | None = None) -> int:
                         "pc_success": overall.get("pc_success"),
                         "avg_sum_reward": overall.get("avg_sum_reward"),
                         "n_episodes": overall.get("n_episodes"),
+                        "n_ompl_failures": overall.get("n_ompl_failures"),
+                        "pc_ompl_failure": overall.get("pc_ompl_failure"),
+                        "pc_non_ompl_failure": overall.get("pc_non_ompl_failure"),
+                        "ompl_failure_counts": overall.get("ompl_failure_counts"),
                         "eval_info_path": str(eval_info_path),
                         "wandb_metric_prefix": metric_prefix,
                     }

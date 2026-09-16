@@ -173,6 +173,10 @@ class ACTSegmentPolicy(ACTPolicy):
         """Return and clear per-row telemetry from the last ``select_action`` call."""
         return self._segment_rollout.consume_hybrid_step_telemetry()
 
+    def snapshot_ompl_episode_failures(self) -> list[dict[str, Any] | None]:
+        """Per-row last OMPL failure for the current episode (does not clear)."""
+        return self._segment_rollout.snapshot_ompl_episode_failures()
+
     def pop_completed_chunks(self) -> list[HybridChunkTelemetry]:
         """Return and clear policy chunks completed since the last pop."""
         return self._segment_rollout.pop_completed_chunks()
