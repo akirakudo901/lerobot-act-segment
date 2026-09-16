@@ -1,0 +1,74 @@
+#!/usr/bin/env python
+
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# IMPLEMENTED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+
+from dataclasses import dataclass
+
+from hybrid_eval.segment.configuration_segment import (
+    SegmentPolicyConfigMixin,
+    rewrite_legacy_ompl_cli_args,
+)
+
+from lerobot.configs import PreTrainedConfig
+
+from ..diffusion.configuration_diffusion import DiffusionConfig
+
+
+@PreTrainedConfig.register_subclass("diffusion_segment")
+@dataclass
+class DiffusionSegmentConfig(DiffusionConfig, SegmentPolicyConfigMixin):
+    """Diffusion Policy with an auxiliary per-horizon MP/L BIO label head.
+
+    Hybrid rollout + segment CE knobs come from :class:`SegmentPolicyConfigMixin`.
+    Fields below are Diffusion-specific (action MSE reweighting, processors).
+    """
+
+    # Scales the MP execution-frame MSE term: weighted_mse = l_mse_loss + mp_mse_weight * mp_mse_loss.
+    mp_mse_weight: float = 1.0
+
+    # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
+    # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
+    # ``lerobot`` for datasets with ee_pos + ee_ori + gripper (no reorder step),
+    # ``efficient_libero`` for legacy efficient exports (gripper + ee_pos + ee_ori).
+    observation_state_layout: str | None = None
+
+    @property
+    def label_delta_indices(self) -> list[int]:
+        return list(self.action_delta_indices)
+
+
+def _patch_pretrained_ompl_cli_overrides() -> None:
+    """Rewrite legacy ``--ompl_*`` CLI overrides when loading a pretrained policy."""
+    orig = PreTrainedConfig.from_pretrained
+    if getattr(orig, "_ompl_cli_rewrite", False):
+        return
+    orig_func = orig.__func__
+
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **policy_kwargs):  # type: ignore[no-untyped-def]
+        overrides = policy_kwargs.get("cli_overrides")
+        if overrides:
+            policy_kwargs["cli_overrides"] = rewrite_legacy_ompl_cli_args(list(overrides))
+        return orig_func(cls, pretrained_name_or_path, **policy_kwargs)
+
+    from_pretrained._ompl_cli_rewrite = True  # type: ignore[attr-defined]
+    PreTrainedConfig.from_pretrained = from_pretrained
+
+
+_patch_pretrained_ompl_cli_overrides()

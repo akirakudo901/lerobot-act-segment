@@ -14,6 +14,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# MODIFIED BY akirakudo901 for the hybrid-motion-planner project
+# see: https://github.com/akirakudo901/lerobot-act-segment
+# Add helpers so the diffusion segment model can reuse them (logic unchanged)
+
 """Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
 
 TODO(alexander-soare):
@@ -194,7 +199,11 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        # Hybrid-motion-planner extension (akirakudo901)
+        # Flattened FiLM / label-head size: (state [+ rgb * cameras] [+ env_state]) * n_obs_steps.
+        self.global_cond_dim = global_cond_dim * config.n_obs_steps
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=self.global_cond_dim)
+        # Hybrid-motion-planner extension END (akirakudo901)
 
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
@@ -291,6 +300,24 @@ class DiffusionModel(nn.Module):
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+    
+    def _generate_horizon_from_batch(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """Denoise a full-horizon action trajectory.
+
+        Returns:
+            actions: (B, horizon, action_dim) sampled trajectory.
+            global_cond: (B, global_cond_dim) observation conditioning used by the UNet (and
+                subclass heads that condition on the same vector).
+        """
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        return actions, global_cond
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """
@@ -303,24 +330,16 @@ class DiffusionModel(nn.Module):
             "observation.environment_state": (B, n_obs_steps, environment_dim)
         }
         """
-        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        assert n_obs_steps == self.config.n_obs_steps
-
-        # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-
-        # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        actions, _global_cond = self._generate_horizon_from_batch(batch, noise=noise)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
-        start = n_obs_steps - 1
+        start = batch[OBS_STATE].shape[1] - 1
         end = start + self.config.n_action_steps
-        actions = actions[:, start:end]
+        return actions[:, start:end]
 
-        return actions
+    def _denoise_from_batch(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """One training-time noising step and UNet forward.
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """
         This function expects `batch` to have (at least):
         {
             "observation.state": (B, n_obs_steps, state_dim)
@@ -332,6 +351,11 @@ class DiffusionModel(nn.Module):
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
+
+        Returns:
+            pred: UNet output (noise or denoised sample, per ``prediction_type``).
+            target: Supervision target matching ``pred``.
+            global_cond: Flattened observation conditioning.
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
@@ -361,7 +385,6 @@ class DiffusionModel(nn.Module):
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
-        # Compute the loss.
         # The target is either the original trajectory, or the noise.
         if self.config.prediction_type == "epsilon":
             target = eps
@@ -370,6 +393,10 @@ class DiffusionModel(nn.Module):
         else:
             raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
 
+        return pred, target, global_cond
+
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        pred, target, _global_cond = self._denoise_from_batch(batch)
         loss = F.mse_loss(pred, target, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
