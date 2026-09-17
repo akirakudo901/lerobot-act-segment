@@ -212,8 +212,10 @@ class ACTSegmentPolicy(ACTPolicy):
         batch: dict[str, Tensor],
         *,
         sample_latent_prior: bool = False,
+        **kwargs,
     ) -> tuple[Tensor, Tensor]:
         """Return both the actions and argmax segment labels for each step in the predicted chunk."""
+        del kwargs
         self.eval()
         batch = self._prepare_batch(batch)
         actions, labels_logits, _vae_params = self.model(
