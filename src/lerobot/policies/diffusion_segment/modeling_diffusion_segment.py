@@ -22,6 +22,9 @@
 
 from __future__ import annotations
 
+from typing import Any, Sequence
+
+import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
@@ -32,9 +35,19 @@ from hybrid_eval.segment.losses import (
     mp_l_action_masks,
     segment_label_ce,
 )
+from hybrid_eval.segment import rollout_wrapper as _segment_rollout_mod
+from hybrid_eval.segment.rollout_wrapper import (
+    HybridChunkTelemetry,
+    HybridStepTelemetry,
+    IkPending,
+    SegmentRolloutWrapper,
+)
 from lerobot.utils.constants import ACTION
+from lerobot.utils.import_utils import require_package
 
-from ..diffusion.modeling_diffusion import DiffusionModel
+from ..diffusion.modeling_diffusion import DiffusionModel, DiffusionPolicy
+from ..pretrained import PreTrainedPolicy
+from ..utils import populate_queues
 from .configuration_diffusion_segment import DiffusionSegmentConfig
 
 
@@ -104,3 +117,177 @@ class DiffusionSegmentModel(DiffusionModel):
             **label_loss_dict,
         }
         return loss, loss_dict
+
+
+class DiffusionSegmentPolicy(DiffusionPolicy):
+    """Diffusion Policy with auxiliary BIO segment-label CE and optional hybrid rollout."""
+
+    config_class = DiffusionSegmentConfig
+    name = "diffusion_segment"
+
+    def __init__(self, config: DiffusionSegmentConfig, **kwargs):
+        require_package("diffusers", extra="diffusion")
+        PreTrainedPolicy.__init__(self, config)
+        config.validate_features()
+        self.config = config
+        self._queues = None
+        self.diffusion = DiffusionSegmentModel(config)
+
+        dataset_meta = kwargs.get("dataset_meta")
+        dataset_root = getattr(dataset_meta, "root", None) if dataset_meta is not None else None
+        self._segment_rollout = SegmentRolloutWrapper(
+            self,
+            config,
+            dataset_root=dataset_root,
+            pretrained_path=config.pretrained_path,
+        )
+        self.reset()
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward hybrid orchestrator state to the composed rollout wrapper.
+
+        Lets eval hooks and existing tests keep reading ``policy._connector``,
+        ``policy._chunk_t``, ``policy._ompl_trackers``, etc. Falls through to
+        ``nn.Module.__getattr__`` for registered parameters / submodules.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        if name == "_segment_rollout":
+            raise AttributeError(name)
+        try:
+            rollout = object.__getattribute__(self, "_segment_rollout")
+        except AttributeError as exc:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            ) from exc
+        if hasattr(rollout, name):
+            return getattr(rollout, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def reset(self):
+        """Clear observation/action queues and hybrid orchestrator chunk state."""
+        super().reset()
+        self._segment_rollout.reset()
+
+    def set_rollout_action_processors(
+        self,
+        postprocessor: Any | None,
+        *,
+        mp_rescaling_ctx: Any | None = _segment_rollout_mod._UNSET_MP_RESCALING_CTX,
+    ) -> None:
+        """Attach eval-time action postprocessing used inside :meth:`select_action`."""
+        self._segment_rollout.set_rollout_action_processors(
+            postprocessor, mp_rescaling_ctx=mp_rescaling_ctx
+        )
+
+    def set_dummy_action(self, action: Sequence[float] | None) -> None:
+        """Override the no-op action used for ``ik_pose_setter`` MP trigger frames."""
+        self._segment_rollout.set_dummy_action(action)
+
+    def bind_eval_env(self, env: Any | None) -> None:
+        """Associate this policy with a VectorEnv for hybrid MP (Layer-1 OMPL RPC)."""
+        self._segment_rollout.bind_eval_env(env)
+
+    def set_rollout_step(self, step: int) -> None:
+        """Set the current episode step index (used for chunk anchor bookkeeping)."""
+        self._segment_rollout.set_rollout_step(step)
+
+    def consume_ik_pending(self) -> IkPending | None:
+        """Return and clear IK targets from the last ``select_action`` call."""
+        return self._segment_rollout.consume_ik_pending()
+
+    def consume_ompl_torque_actions(self) -> list[Any | None]:
+        """Return and clear 8-D ``JOINT_TORQUE`` actions from the last ``select_action``."""
+        return self._segment_rollout.consume_ompl_torque_actions()
+
+    def set_collect_tracker_traces(self, rows: Sequence[int] | None) -> None:
+        """Enable Layer-2 tracker traces for VectorEnv rows (eval spline/waypoint viz)."""
+        self._segment_rollout.set_collect_tracker_traces(rows)
+
+    def consume_ompl_tracker_traces(self) -> list[list[Any]]:
+        """Return and clear per-row Layer-2 tracker traces from the last episode."""
+        return self._segment_rollout.consume_ompl_tracker_traces()
+
+    def consume_hybrid_step_telemetry(self) -> list[HybridStepTelemetry | None]:
+        """Return and clear per-row telemetry from the last ``select_action`` call."""
+        return self._segment_rollout.consume_hybrid_step_telemetry()
+
+    def pop_completed_chunks(self) -> list[HybridChunkTelemetry]:
+        """Return and clear policy chunks completed since the last pop."""
+        return self._segment_rollout.pop_completed_chunks()
+
+    def finalize_rollout_chunks(self) -> list[HybridChunkTelemetry]:
+        """Emit any in-progress chunks at episode end (call before ``reset``)."""
+        return self._segment_rollout.finalize_rollout_chunks()
+
+    @torch.no_grad()
+    def predict_action_label_chunk(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        sample_latent_prior: bool = False,
+        env_rows: Sequence[int] | None = None,
+        noise: Tensor | None = None,
+        **kwargs,
+    ) -> tuple[Tensor, Tensor]:
+        """Denoise a full horizon, classify from ``global_cond``, then slice to ``n_action_steps``.
+
+        Stacks observation queues (history) rather than the current-frame mini-batch so
+        ``n_obs_steps > 1`` is preserved. ``env_rows`` selects original VectorEnv rows from
+        those queues when the wrapper refills a subset of envs.
+        """
+        del sample_latent_prior, kwargs  # ACT VAE retry knob; diffusion is deterministic given ``noise``.
+        self.eval()
+        stacked = self._stack_obs_queues(batch, env_rows=env_rows)
+        actions, label_logits = self.diffusion.generate_actions_and_labels(stacked, noise=noise)
+        labels = label_logits.argmax(dim=-1)
+        return self._slice_execute_window(actions), self._slice_execute_window(labels)
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Select one action per env.
+
+        Vanilla mode keeps stock Diffusion action-queue rollout. Hybrid mode updates
+        observation queues on the **full** batch (including rows mid-OMPL) then delegates
+        refill / OMPL to :class:`SegmentRolloutWrapper`.
+        """
+        if not self.config.use_hybrid_orchestrator:
+            return super().select_action(batch, noise=noise)
+
+        batch = self._prepare_select_batch(batch)
+        self._queues = populate_queues(self._queues, batch)
+        return self._segment_rollout.select_action(batch)
+
+    @torch.no_grad()
+    def per_step_val_losses(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Return per-horizon-step action L1 (one denoise) and label CE for offline val.
+
+        Returns:
+            action_l1: ``[B, T]`` mean L1 over action dims per valid step.
+            label_ce: ``[B, T]`` cross-entropy per valid step.
+            valid_mask: ``[B, T]`` bool mask (action and label both valid).
+        """
+        batch = self._prepare_forward_batch(batch)
+        actions_hat, labels_logits = self.diffusion.generate_actions_and_labels(batch)
+
+        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
+        action_valid_mask = ~batch["action_is_pad"]
+        action_l1 = abs_err.mean(dim=-1)
+
+        targets = label_targets(batch, self.config.label_feature_key)
+        valid_labels = label_valid_mask(batch, self.config.label_feature_key)
+        per_step_ce = F.cross_entropy(
+            labels_logits.reshape(-1, self.config.num_label_classes),
+            targets.reshape(-1),
+            reduction="none",
+        ).view(labels_logits.shape[0], labels_logits.shape[1])
+
+        valid_mask = action_valid_mask & valid_labels
+        return action_l1, per_step_ce, valid_mask
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+        """Image-stack like parent, then diffusion MSE (MP/L-split) + segment-label CE."""
+        batch = self._prepare_forward_batch(batch)
+        return self.diffusion.compute_loss(batch)
