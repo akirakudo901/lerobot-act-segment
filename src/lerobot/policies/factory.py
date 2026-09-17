@@ -50,6 +50,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 from .act.configuration_act import ACTConfig
 from .act_segment.configuration_act_segment import ACTSegmentConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
+from .diffusion_segment.configuration_diffusion_segment import DiffusionSegmentConfig
 from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
@@ -109,6 +110,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .diffusion.modeling_diffusion import DiffusionPolicy
 
         return DiffusionPolicy
+    elif name == "diffusion_segment":
+        from .diffusion_segment.modeling_diffusion_segment import DiffusionSegmentPolicy
+
+        return DiffusionSegmentPolicy
     elif name == "act":
         from .act.modeling_act import ACTPolicy
 
@@ -195,6 +200,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
+    elif policy_type == "diffusion_segment":
+        return DiffusionSegmentConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
     elif policy_type == "act_segment":
@@ -304,12 +311,16 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
-        act_segment_prepend_state_layout_step = None
+        segment_prepend_state_layout_step = None
         if isinstance(policy_cfg, ACTSegmentConfig):
             # Saved act_segment preprocessors may reference custom registry steps
             # (e.g. efficient_libero_state_reorder); import before from_pretrained.
             from .act_segment.processor_act_segment import (
-                prepend_act_segment_state_layout_step as act_segment_prepend_state_layout_step,
+                prepend_act_segment_state_layout_step as segment_prepend_state_layout_step,
+            )
+        elif isinstance(policy_cfg, DiffusionSegmentConfig):
+            from .diffusion_segment.processor_diffusion_segment import (
+                prepend_diffusion_segment_state_layout_step as segment_prepend_state_layout_step,
             )
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(
@@ -331,8 +342,8 @@ def make_pre_post_processors(
             to_output=transition_to_policy_action,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
-        if act_segment_prepend_state_layout_step is not None:
-            preprocessor = act_segment_prepend_state_layout_step(preprocessor, policy_cfg)
+        if segment_prepend_state_layout_step is not None:
+            preprocessor = segment_prepend_state_layout_step(preprocessor, policy_cfg)
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type
@@ -340,6 +351,16 @@ def make_pre_post_processors(
         from .tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
 
         processors = make_tdmpc_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, DiffusionSegmentConfig):
+        from .diffusion_segment.processor_diffusion_segment import (
+            make_diffusion_segment_pre_post_processors,
+        )
+
+        processors = make_diffusion_segment_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
