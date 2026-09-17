@@ -35,6 +35,26 @@ from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
 
 
+def _mp_aug_ready_action_window_size(
+    trainable_config: PreTrainedConfig | RewardModelConfig,
+) -> int:
+    """Action-window length for MP aug-ready padding / virtual segments.
+
+    ACT-family configs expose ``chunk_size``; Diffusion-family configs expose
+    ``horizon`` for the same role (number of action frames in a training sample).
+    """
+    chunk_size = getattr(trainable_config, "chunk_size", None)
+    if chunk_size is not None:
+        return int(chunk_size)
+    horizon = getattr(trainable_config, "horizon", None)
+    if horizon is not None:
+        return int(horizon)
+    raise ValueError(
+        "enable_mp_aug_ready_transforms requires trainable_config.chunk_size "
+        "(e.g. act_segment) or trainable_config.horizon (e.g. diffusion_segment)."
+    )
+
+
 def _maybe_wrap_mp_aug_ready_dataset(
     dataset: LeRobotDataset | MultiLeRobotDataset,
     dataset_cfg: DatasetConfig,
@@ -56,12 +76,7 @@ def _maybe_wrap_mp_aug_ready_dataset(
 
     from dataset.loaders.mp_aug_ready_train_dataset import wrap_mp_aug_ready_dataset
 
-    chunk_size = getattr(trainable_config, "chunk_size", None)
-    if chunk_size is None:
-        raise ValueError(
-            "enable_mp_aug_ready_transforms requires trainable_config.chunk_size "
-            "(e.g. act_segment policy)."
-        )
+    chunk_size = _mp_aug_ready_action_window_size(trainable_config)
 
     # Coverage follows the same train/val gate as MP-shift. last-L stays as configured.
     enable_coverage = bool(dataset_cfg.enable_intermediate_waypoint_coverage) and (
