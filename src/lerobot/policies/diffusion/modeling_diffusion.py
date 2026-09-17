@@ -27,7 +27,7 @@ TODO(alexander-soare):
 
 import math
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import einops
@@ -90,6 +90,53 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         self.reset()
 
+    def _prepare_forward_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Stack camera images into ``observation.images`` for training / val forwards."""
+        if not self.config.image_features:
+            return batch
+        batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+        for key in self.config.image_features:
+            if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
+                batch[key] = batch[key].unsqueeze(1)
+        batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        return batch
+
+    def _prepare_select_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Drop GT actions and stack camera images before updating observation queues."""
+        if ACTION in batch:
+            batch = dict(batch)
+            batch.pop(ACTION)
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        return batch
+
+    def _stack_obs_queues(
+        self,
+        batch: dict[str, Tensor],
+        env_rows: Sequence[int] | None = None,
+    ) -> dict[str, Tensor]:
+        """
+        Stack ``n_obs_steps`` of queued observations, optionally indexing env rows
+        when only querying for a subset of the environments.
+        """
+        stacked = {
+            k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues
+        }
+        if env_rows is None:
+            return stacked
+        if not stacked:
+            raise KeyError(
+                "Cannot index env_rows; observation queues were not populated for this batch."
+            )
+        device = next(iter(stacked.values())).device
+        row_index = torch.as_tensor(list(env_rows), device=device, dtype=torch.long)
+        return {k: v.index_select(0, row_index) for k, v in stacked.items()}
+
+    def _slice_execute_window(self, tensor: Tensor) -> Tensor:
+        """Keep the current-obs execute window ``[n_obs_steps-1, n_obs_steps-1+n_action_steps)``."""
+        return self.diffusion._slice_execute_window(tensor)
+
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
 
@@ -107,8 +154,7 @@ class DiffusionPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
-        # stack n latest observations from the queue
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        batch = self._stack_obs_queues(batch)
         actions = self.diffusion.generate_actions(batch, noise=noise)
 
         return actions
@@ -135,14 +181,9 @@ class DiffusionPolicy(PreTrainedPolicy):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
-        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
-        if ACTION in batch:
-            batch.pop(ACTION)
-
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        # NOTE: It's important that this happens after stacking the images into a single key.
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out.
+        # NOTE: It's important that queues are populated after stacking the images into a single key.
+        batch = self._prepare_select_batch(batch)
         self._queues = populate_queues(self._queues, batch)
 
         if len(self._queues[ACTION]) == 0:
@@ -154,12 +195,7 @@ class DiffusionPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            for key in self.config.image_features:
-                if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
-                    batch[key] = batch[key].unsqueeze(1)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        batch = self._prepare_forward_batch(batch)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -300,7 +336,13 @@ class DiffusionModel(nn.Module):
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
-    
+
+    def _slice_execute_window(self, tensor: Tensor) -> Tensor:
+        """Keep the current-obs execute window ``[n_obs_steps-1, n_obs_steps-1+n_action_steps)``."""
+        start = self.config.n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        return tensor[:, start:end]
+
     def _generate_horizon_from_batch(
         self, batch: dict[str, Tensor], noise: Tensor | None = None
     ) -> tuple[Tensor, Tensor]:
@@ -333,9 +375,7 @@ class DiffusionModel(nn.Module):
         actions, _global_cond = self._generate_horizon_from_batch(batch, noise=noise)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
-        start = batch[OBS_STATE].shape[1] - 1
-        end = start + self.config.n_action_steps
-        return actions[:, start:end]
+        return self._slice_execute_window(actions)
 
     def _denoise_from_batch(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         """One training-time noising step and UNet forward.
