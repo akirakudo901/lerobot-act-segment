@@ -71,6 +71,7 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+from hybrid_eval.segment import is_segment_policy_config
 
 from .lerobot_eval import _configure_act_segment_rollout_processors, eval_policy_all
 
@@ -475,7 +476,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if val_episodes_resolved is None and is_main_process:
             n_val = len(val_dataset.episodes) if val_dataset.episodes is not None else val_dataset.num_episodes
             logging.info(f"Offline val dataset loaded: val_episodes={n_val}")
-        if cfg.policy.type == "act_segment":
+        if is_segment_policy_config(cfg.policy):
             label_feature_key = getattr(cfg.policy, "label_feature_key", "frame_label_int")
             val_episode_spans = build_episode_span_tables(
                 val_dataset,
@@ -665,7 +666,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     accelerator=accelerator,
                     camera_keys=dataset.meta.camera_keys,
                 )
-                if cfg.policy.type == "act_segment" and val_episode_spans is not None:
+                if is_segment_policy_config(cfg.policy) and val_episode_spans is not None:
                     segment_metrics = compute_offline_val_segment_loss(
                         policy=policy,
                         val_dataloader=val_dataloader,
@@ -688,15 +689,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
         if cfg.env and is_eval_step:
             if is_main_process:
-                from lerobot.policies.act_segment.configuration_act_segment import ACTSegmentConfig
-
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
                 # Save all eval rollout videos under output_dir/eval/; WandB still gets
                 # only the first one below. Segment policies use hybrid-viz rendering
                 # (same as lerobot-eval-hybrid-viz) instead of plain third-person MP4s.
                 eval_videos_dir = cfg.output_dir / "eval" / f"videos_step_{step_id}"
-                use_hybrid_viz = isinstance(cfg.policy, ACTSegmentConfig)
+                use_hybrid_viz = is_segment_policy_config(cfg.policy)
                 eval_video_kwargs: dict[str, Any] = (
                     {"hybrid_videos_dir": eval_videos_dir}
                     if use_hybrid_viz

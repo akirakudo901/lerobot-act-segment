@@ -114,10 +114,10 @@ def _ik_obs_hook_class(env: gym.vector.VectorEnv) -> type | None:
 
 # Hybrid-motion-planner extension (akirakudo901)
 def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_cfg: Any, postprocessor) -> None:
-    """Wire eval postprocessor into act_segment ``select_action``."""
-    from lerobot.policies.act_segment.configuration_act_segment import ACTSegmentConfig
+    """Wire eval postprocessor into segment-policy ``select_action``."""
+    from hybrid_eval.segment import is_segment_policy_config
 
-    if not isinstance(policy_cfg, ACTSegmentConfig):
+    if not is_segment_policy_config(policy_cfg):
         return
 
     set_processors = getattr(policy, "set_rollout_action_processors", None)

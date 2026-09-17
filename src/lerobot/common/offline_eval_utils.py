@@ -362,12 +362,11 @@ def compute_offline_val_segment_loss(
     label_delta_indices: list[int],
 ) -> dict[str, float]:
     """Run segment-aware validation and return MP/L span and pattern metrics."""
-    from lerobot.policies.act_segment.modeling_act_segment import ACTSegmentPolicy
-
     unwrapped = accelerator.unwrap_model(policy)
-    if not isinstance(unwrapped, ACTSegmentPolicy):
+    per_step_val_losses = getattr(unwrapped, "per_step_val_losses", None)
+    if not callable(per_step_val_losses):
         raise TypeError(
-            "compute_offline_val_segment_loss requires ACTSegmentPolicy, "
+            "compute_offline_val_segment_loss requires a policy with per_step_val_losses, "
             f"got {type(unwrapped).__name__}."
         )
 
@@ -392,7 +391,7 @@ def compute_offline_val_segment_loss(
                     batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
             batch = preprocessor(batch)
 
-            action_l1, label_ce, valid_mask = unwrapped.per_step_val_losses(batch)
+            action_l1, label_ce, valid_mask = per_step_val_losses(batch)
             batch_size = len(episode_indices)
 
             for row in range(batch_size):
