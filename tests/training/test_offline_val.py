@@ -118,6 +118,16 @@ def test_relative_episode_spans_identity_without_filter(tmp_path):
     assert rel_to[-1] == len(dataset)
 
 
+def test_relative_episode_spans_uses_wrapper_dataloader_spans():
+    class Wrapper:
+        def dataloader_episode_spans(self):
+            return [0, 4], [4, 7]
+
+    rel_from, rel_to = relative_episode_spans(Wrapper())
+    assert rel_from == [0, 4]
+    assert rel_to == [4, 7]
+
+
 def test_relative_episode_spans_for_episode_subset(tmp_path):
     _dataset, root = make_dummy_dataset(["camera1"], tmp_path, n_episodes=5)
     dataset = LeRobotDataset(DUMMY_REPO_ID, root=root, episodes=[0, 2])

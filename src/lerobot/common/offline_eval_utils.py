@@ -112,7 +112,15 @@ def relative_episode_spans(dataset: "LeRobotDataset") -> tuple[list[int], list[i
 
     Unloaded episodes keep a zero-length ``(0, 0)`` placeholder so the lists
     stay aligned with original episode indices 0..N-1.
+
+    Augmentation-ready wrappers expose ``dataloader_episode_spans()`` because
+    they are not ``LeRobotDataset`` instances (no ``_ensure_reader``) and
+    ``__getitem__`` indexes sampleable virtual frames, not the base HF table.
     """
+    spans_fn = getattr(dataset, "dataloader_episode_spans", None)
+    if callable(spans_fn):
+        return spans_fn()
+
     from_abs = [int(x) for x in dataset.meta.episodes["dataset_from_index"]]
     to_abs = [int(x) for x in dataset.meta.episodes["dataset_to_index"]]
     if dataset.episodes is None:
