@@ -165,6 +165,10 @@ class ACTSegmentPolicy(ACTPolicy):
         """Enable Layer-2 tracker traces for VectorEnv rows (eval spline/waypoint viz)."""
         self._segment_rollout.set_collect_tracker_traces(rows)
 
+    def collecting_tracker_traces(self) -> bool:
+        """True when at least one VectorEnv row will record Layer-2 tracker traces."""
+        return self._segment_rollout.collecting_tracker_traces()
+
     def consume_ompl_tracker_traces(self) -> list[list[Any]]:
         """Return and clear per-row Layer-2 tracker traces from the last episode."""
         return self._segment_rollout.consume_ompl_tracker_traces()

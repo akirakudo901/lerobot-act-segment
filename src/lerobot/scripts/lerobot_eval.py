@@ -311,9 +311,16 @@ def _attach_live_arm_dynamics_for_ompl(
     env: gym.vector.VectorEnv,
     observation: dict[str, Any],
 ) -> None:
-    """Attach physical arm q/qd/qdd/M for computed-torque MP (before policy normalize)."""
+    """Attach physical arm q/qd/qdd/M for computed-torque *traces* (before normalize).
+
+    The sim spline controller reads ``M(q)`` on its own inner loop. This RPC is
+    only needed when Layer-2 tracker figures will be written for the batch.
+    """
     cfg = getattr(policy, "config", None)
     if cfg is None or not _uses_spline_torque_eval(cfg):
+        return
+    collecting = getattr(policy, "collecting_tracker_traces", None)
+    if callable(collecting) and not collecting():
         return
     try:
         snapshots = list(env.call("arm_dynamics_snapshot"))
