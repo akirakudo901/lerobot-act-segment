@@ -244,6 +244,18 @@ def _snapshot_ompl_episode_failures(policy: PreTrainedPolicy, n_envs: int) -> li
     return rows[:n_envs]
 
 
+def _ompl_plan_exhausted_mask(policy: PreTrainedPolicy, n_envs: int) -> np.ndarray:
+    """Per-env OMPL ``terminate_hold`` flags; missing hook → all False."""
+    mask = np.zeros(n_envs, dtype=bool)
+    mask_fn = getattr(policy, "ompl_plan_exhausted_mask", None)
+    if not callable(mask_fn):
+        return mask
+    rows = list(mask_fn() or [])
+    for i, flag in enumerate(rows[:n_envs]):
+        mask[i] = bool(flag)
+    return mask
+
+
 def _set_collect_tracker_traces(policy: PreTrainedPolicy, rows: Any) -> None:
     """Enable Layer-2 tracker traces for selected VectorEnv rows (or disable)."""
     setter = getattr(policy, "set_collect_tracker_traces", None)
@@ -366,6 +378,9 @@ def rollout(
 
     Note that all environments in the batch are run until the last environment is done. This means some
     data will probably need to be discarded (for environments that aren't the first one to be done).
+    
+    With Hybrid OMPL ``terminate_hold``, an environment holding due to planning failure is considered ``done``
+    for rollout purposes (i.e. rollout goes to next batch when all envs are either done or holding from failure.)
 
     The return dictionary contains:
         (optional) "observation": A dictionary of (batch, sequence + 1, *) tensors mapped to observation
@@ -422,6 +437,9 @@ def rollout(
         leave=False,
     )
     check_env_attributes_and_types(env)
+    
+    from hybrid_eval.segment.rollout_wrapper import merge_ompl_hold_into_done
+
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
@@ -560,6 +578,12 @@ def rollout(
         done = terminated | truncated | done
         if step + 1 == max_steps:
             done = np.ones_like(done, dtype=bool)
+        # Hybrid-motion-planner extension (akirakudo901): cut dummy OMPL holds
+        # when no env is still asking for decisions (no gym terminated / autoreset).
+        if merge_ompl_hold_into_done is not None:
+            done = merge_ompl_hold_into_done(
+                done, _ompl_plan_exhausted_mask(policy, env.num_envs)
+            )
         # Hybrid-motion-planner extension (akirakudo901): update which environment are done
         env_done_recorded = env_done_recorded | done
 
