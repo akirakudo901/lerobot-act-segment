@@ -20,6 +20,7 @@ from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterp
 from .act.configuration_act import ACTConfig as ACTConfig
 from .act_segment.configuration_act_segment import ACTSegmentConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .diffusion_segment.configuration_diffusion_segment import DiffusionSegmentConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
 from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
@@ -46,6 +47,7 @@ __all__ = [
     "ACTConfig",
     "ACTSegmentConfig",
     "DiffusionConfig",
+    "DiffusionSegmentConfig",
     "EO1Config",
     "GaussianActorConfig",
     "GrootConfig",
