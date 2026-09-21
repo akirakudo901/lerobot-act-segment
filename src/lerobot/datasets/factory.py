@@ -124,7 +124,7 @@ def resolve_delta_timestamps(
             delta_timestamps against.
 
     Policies that supervise per-frame labels over an action chunk may expose optional
-    ``label_feature_key`` and ``label_delta_indices`` attributes (e.g. ``act_segment``).
+    ``label_feature_key`` and ``label_delta_indices`` attributes (e.g. ``act_segment``, ``act_label``).
     When present and the label key exists in the dataset, it is chunked like ``action``.
 
     Returns:
