@@ -41,6 +41,7 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
+from .label_encoder_tokens import append_label_encoder_tokens, encoder_label_ids
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -514,6 +515,11 @@ class ACT(nn.Module):
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
+        # Optional BIO(+pad) label tokens for a conditioned action body. Inserted after
+        # latent / state tokens and before image tokens. Never used by the VAE encoder.
+        if self._has_label_encoder_tokens():
+            self._append_label_encoder_tokens(encoder_in_tokens, encoder_in_pos_embed, batch)
+
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
@@ -557,6 +563,41 @@ class ACT(nn.Module):
         actions = self.action_head(decoder_out)
 
         return actions, (mu, log_sigma_x2), decoder_out
+
+    def _has_label_encoder_tokens(self) -> bool:
+        return getattr(self, "label_embed", None) is not None
+
+    def _init_label_encoder_tokens(self) -> None:
+        """Create BIO(+pad) embeddings used as extra encoder tokens.
+
+        Call from a subclass ``__init__`` after ``super().__init__``. Vanilla ACT
+        does not call this, so existing checkpoints keep the same parameter set.
+        """
+        num_label_classes = int(getattr(self.config, "num_label_classes"))
+        self.label_pad_id = num_label_classes
+        self.label_embed = nn.Embedding(num_label_classes + 1, self.config.dim_model)
+        self.label_pos_embed = nn.Embedding(self.config.chunk_size, self.config.dim_model)
+
+    def _append_label_encoder_tokens(
+        self,
+        encoder_in_tokens: list[Tensor],
+        encoder_in_pos_embed: list[Tensor],
+        batch: dict[str, Tensor],
+    ) -> None:
+        label_feature_key = str(getattr(self.config, "label_feature_key", "frame_label_int"))
+        label_ids = encoder_label_ids(
+            batch,
+            label_feature_key=label_feature_key,
+            num_label_classes=self.label_pad_id,
+            chunk_size=self.config.chunk_size,
+        )
+        append_label_encoder_tokens(
+            encoder_in_tokens,
+            encoder_in_pos_embed,
+            label_ids,
+            self.label_embed,
+            self.label_pos_embed,
+        )
 
 
 class ACTEncoder(nn.Module):
