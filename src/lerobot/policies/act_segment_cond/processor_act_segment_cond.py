@@ -37,7 +37,7 @@ def prepend_act_segment_cond_state_layout_step(
     config: ACTSegmentCondConfig,
 ) -> PolicyProcessorPipeline[dict[str, Any], dict[str, Any]]:
     """Prepend a state-layout reorder step when configured."""
-    return prepend_act_segment_state_layout_step(preprocessor, config)  # type: ignore[arg-type]
+    return prepend_act_segment_state_layout_step(preprocessor, config)
 
 
 def make_act_segment_cond_pre_post_processors(
@@ -48,4 +48,4 @@ def make_act_segment_cond_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """Same ACT pre/post-processors as ``act_segment``, including label targets."""
-    return make_act_segment_pre_post_processors(config, dataset_stats=dataset_stats)  # type: ignore[arg-type]
+    return make_act_segment_pre_post_processors(config, dataset_stats=dataset_stats)

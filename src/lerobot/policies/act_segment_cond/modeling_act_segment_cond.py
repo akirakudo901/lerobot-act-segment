@@ -21,24 +21,15 @@
 
 from __future__ import annotations
 
-from collections import deque
 from typing import Protocol
 
 import torch
-import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
-from lerobot.utils.constants import ACTION, OBS_IMAGES
-
-from ..act.modeling_act import ACT, ACTPolicy, ACTTemporalEnsembler
-from ..pretrained import PreTrainedPolicy
-from hybrid_eval.segment.losses import (
-    label_targets,
-    label_valid_mask,
-    masked_action_loss_mean,
-    mp_l_action_masks,
-)
-from hybrid_eval.segment.policy_mixin import SegmentRolloutPolicyMixin
+from ..act.configuration_act import ACTConfig
+from ..act.hybrid_act import HybridACTPolicy
+from ..act.modeling_act import ACT
+from hybrid_eval.segment.losses import label_targets
 from .configuration_act_segment_cond import ACTSegmentCondConfig
 
 
@@ -54,39 +45,18 @@ class ACTSegmentCond(ACT):
         self._init_label_encoder_tokens()
 
 
-class ACTSegmentCondPolicy(SegmentRolloutPolicyMixin, ACTPolicy):
+class ACTSegmentCondPolicy(HybridACTPolicy):
     """Action ACT trained with GT label tokens; eval labels from GT or frozen ``act_label``."""
 
     config_class = ACTSegmentCondConfig
     name = "act_segment_cond"
 
     def __init__(self, config: ACTSegmentCondConfig, **kwargs):
-        PreTrainedPolicy.__init__(self, config)
-        config.validate_features()
-        self.config = config
-        self.model = ACTSegmentCond(config)
+        super().__init__(config, **kwargs)
         self._frozen_label_policy: _LabelChunkPredictor | None = None
 
-        if config.use_hybrid_orchestrator and config.temporal_ensemble_coeff is not None:
-            raise ValueError(
-                "use_hybrid_orchestrator is incompatible with temporal_ensemble_coeff"
-            )
-
-        if config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler = ACTTemporalEnsembler(
-                config.temporal_ensemble_coeff, config.chunk_size
-            )
-
-        self._init_segment_rollout(config, **kwargs)
-        self.reset()
-
-    def reset(self):
-        """Clear ACT queues and hybrid orchestrator chunk state."""
-        if self.config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler.reset()
-        else:
-            self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        self._segment_rollout.reset()
+    def _build_model(self, config: ACTConfig) -> ACTSegmentCond:
+        return ACTSegmentCond(config)  # type: ignore[arg-type]
 
     def to(self, *args, **kwargs):
         out = super().to(*args, **kwargs)
@@ -94,12 +64,6 @@ class ACTSegmentCondPolicy(SegmentRolloutPolicyMixin, ACTPolicy):
         if isinstance(frozen, torch.nn.Module):
             frozen.to(*args, **kwargs)
         return out
-
-    def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        if self.config.image_features:
-            batch = dict(batch)
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
-        return batch
 
     def _set_frozen_label_policy(self, policy: _LabelChunkPredictor) -> None:
         """Attach a frozen label model without registering it as an nn.Module child."""
@@ -182,13 +146,6 @@ class ACTSegmentCondPolicy(SegmentRolloutPolicyMixin, ACTPolicy):
         return actions, labels
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select one action per env, possibly via the hybrid orchesctrator's select_action."""
-        if not self.config.use_hybrid_orchestrator:
-            return super().select_action(batch)
-        return self._segment_rollout.select_action(batch)
-
-    @torch.no_grad()
     def per_step_val_losses(
         self,
         batch: dict[str, Tensor],
@@ -198,14 +155,8 @@ class ACTSegmentCondPolicy(SegmentRolloutPolicyMixin, ACTPolicy):
         batch = self._prepare_batch(batch)
         sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
         actions_hat, _vae_params = self.model(batch, sample_encoded_dist)
-
-        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
-        action_valid_mask = ~batch["action_is_pad"]
-        action_l1 = abs_err.mean(dim=-1)
-        valid_labels = label_valid_mask(batch, self.config.label_feature_key)
-        valid_mask = action_valid_mask & valid_labels
-        label_ce = torch.zeros_like(action_l1)
-        return action_l1, label_ce, valid_mask
+        action_l1, valid_mask = self._per_step_action_l1(batch, actions_hat)
+        return action_l1, torch.zeros_like(action_l1), valid_mask
 
     def forward(
         self,
@@ -215,34 +166,6 @@ class ACTSegmentCondPolicy(SegmentRolloutPolicyMixin, ACTPolicy):
         """Teacher-force GT labels into the encoder; MP/L-weighted action L1 (+ optional VAE KLD)."""
         batch = self._prepare_batch(batch)
         sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch, sample_encoded_dist)
-
-        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
-        action_valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        mp_action_mask, l_action_mask = mp_l_action_masks(
-            batch,
-            action_valid_mask,
-            label_feature_key=self.config.label_feature_key,
-        )
-        mp_l1_loss = masked_action_loss_mean(abs_err, mp_action_mask)
-        l_l1_loss = masked_action_loss_mean(abs_err, l_action_mask)
-        weighted_l1_loss = l_l1_loss + self.config.mp_l1_weight * mp_l1_loss
-
-        loss_dict = {
-            "mp_l1_loss": mp_l1_loss.item(),
-            "l_l1_loss": l_l1_loss.item(),
-            "weighted_l1_loss": weighted_l1_loss.item(),
-        }
-
-        if self.config.use_vae:
-            mean_kld = (
-                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp()))
-                .sum(-1)
-                .mean()
-            )
-            loss_dict["kld_loss"] = mean_kld.item()
-            loss = weighted_l1_loss + mean_kld * self.config.kl_weight
-        else:
-            loss = weighted_l1_loss
-
-        return loss, loss_dict
+        actions_hat, vae_params = self.model(batch, sample_encoded_dist)
+        weighted_l1_loss, loss_dict = self._weighted_action_l1(batch, actions_hat)
+        return self._maybe_add_kld(weighted_l1_loss, loss_dict, vae_params)

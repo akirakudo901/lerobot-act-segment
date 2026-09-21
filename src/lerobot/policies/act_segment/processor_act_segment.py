@@ -18,7 +18,7 @@
 # see: https://github.com/akirakudo901/lerobot-act-segment
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -34,7 +34,12 @@ from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
 from ..act.processor_act import make_act_pre_post_processors
-from .configuration_act_segment import ACTSegmentConfig
+
+
+class _LabelChunkActProcessorConfig(Protocol):
+    label_feature_key: str
+    observation_state_layout: str | None
+
 
 _LEROBOT_STATE_LAYOUT = "lerobot"
 _EFFICIENT_LIBERO_STATE_LAYOUT = "efficient_libero"
@@ -85,13 +90,13 @@ def _state_layout_step(layout: str | None) -> ObservationProcessorStep | None:
         return EfficientLiberoStateReorderStep()
     supported = ", ".join(repr(value) for value in _SUPPORTED_STATE_LAYOUTS)
     raise ValueError(
-        f"Unsupported observation_state_layout={layout!r} for act_segment. Supported: {supported}."
+        f"Unsupported observation_state_layout={layout!r}. Supported: {supported}."
     )
 
 
 def prepend_act_segment_state_layout_step(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    config: ACTSegmentConfig,
+    config: _LabelChunkActProcessorConfig,
 ) -> PolicyProcessorPipeline[dict[str, Any], dict[str, Any]]:
     """Prepend a state-layout reorder step when configured."""
     step = _state_layout_step(config.observation_state_layout)
@@ -118,7 +123,7 @@ def _batch_to_transition_with_label(batch: dict[str, Any], label_feature_key: st
 
 
 def make_act_segment_pre_post_processors(
-    config: ACTSegmentConfig,
+    config: _LabelChunkActProcessorConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],

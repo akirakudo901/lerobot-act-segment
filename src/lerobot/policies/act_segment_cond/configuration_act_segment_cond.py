@@ -25,30 +25,23 @@ from hybrid_eval.segment.configuration_segment import SegmentPolicyConfigMixin
 from lerobot.configs import PreTrainedConfig
 
 from ..act.configuration_act import ACTConfig
+from ..act.configuration_hybrid_act import ACTHybridConfigMixin
 
 
 @PreTrainedConfig.register_subclass("act_segment_cond")
 @dataclass
-class ACTSegmentCondConfig(ACTConfig, SegmentPolicyConfigMixin):
+class ACTSegmentCondConfig(ACTConfig, SegmentPolicyConfigMixin, ACTHybridConfigMixin):
     """Full-size ACT action body conditioned on chunked BIO labels.
 
     Train teacher-forces GT ``frame_label_int`` into extra encoder tokens (no label CE).
     Eval ``label_source='predicted'`` runs a frozen ``act_label`` checkpoint first;
     ``label_source='gt'`` reads labels from the batch (offline val / GT replay).
     Hybrid rollout fields come from :class:`SegmentPolicyConfigMixin`.
+    Action L1 / preprocessor knobs come from :class:`ACTHybridConfigMixin`.
     """
-
-    # Scales the MP execution-frame L1 term: weighted_l1 = l_l1_loss + mp_l1_weight * mp_l1_loss.
-    mp_l1_weight: float = 1.0
-    # On requery refill, sample ACT latent from N(0, I) instead of the deterministic zero vector.
-    ompl_retry_sample_latent: bool = True
 
     label_source: Literal["predicted", "gt"] = "predicted"
     label_policy_path: str | None = None
-
-    # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
-    # Default ``None``: no reordering. Same values as ``act_segment``.
-    observation_state_layout: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -56,7 +49,3 @@ class ACTSegmentCondConfig(ACTConfig, SegmentPolicyConfigMixin):
             raise ValueError(
                 f"label_source must be 'predicted' or 'gt', got {self.label_source!r}"
             )
-
-    @property
-    def label_delta_indices(self) -> list[int]:
-        return list(range(self.chunk_size))
