@@ -324,10 +324,12 @@ def _accumulate_deduped_frame_losses(
     local_frame: int,
     action_l1: float,
     label_ce: float,
+    include_action_l1: bool = True,
 ) -> None:
     key = (episode_index, local_frame)
-    frame_action_sums[key] = frame_action_sums.get(key, 0.0) + action_l1
-    frame_action_counts[key] = frame_action_counts.get(key, 0) + 1
+    if include_action_l1:
+        frame_action_sums[key] = frame_action_sums.get(key, 0.0) + action_l1
+        frame_action_counts[key] = frame_action_counts.get(key, 0) + 1
     frame_ce_sums[key] = frame_ce_sums.get(key, 0.0) + label_ce
     frame_ce_counts[key] = frame_ce_counts.get(key, 0) + 1
 
@@ -338,6 +340,8 @@ def aggregate_segment_val_metrics(
     frame_action_counts: dict[FrameLossKey, int],
     frame_ce_sums: dict[FrameLossKey, float],
     frame_ce_counts: dict[FrameLossKey, int],
+    *,
+    include_action_l1: bool = True,
 ) -> dict[str, float]:
     """Aggregate deduped per-frame losses into span, pattern, and segment-type metrics."""
     type_action_values: dict[str, list[float]] = defaultdict(list)
@@ -357,39 +361,41 @@ def aggregate_segment_val_metrics(
             ce_values: list[float] = []
             for local_frame in range(start, end):
                 key = (episode_index, local_frame)
-                if key not in frame_action_counts:
+                if key not in frame_ce_counts:
                     continue
-                action_values.append(frame_action_sums[key] / frame_action_counts[key])
                 ce_values.append(frame_ce_sums[key] / frame_ce_counts[key])
+                if include_action_l1 and key in frame_action_counts:
+                    action_values.append(frame_action_sums[key] / frame_action_counts[key])
 
-            if not action_values:
+            if not ce_values:
                 continue
 
             episode_had_span_loss = True
-            span_action_l1 = float(np.mean(action_values))
             span_label_ce = float(np.mean(ce_values))
-            type_action_values[label].append(span_action_l1)
             type_ce_values[label].append(span_label_ce)
-            pattern_action_values[(pattern_key, span_idx, label)].append(span_action_l1)
             pattern_ce_values[(pattern_key, span_idx, label)].append(span_label_ce)
+            if include_action_l1 and action_values:
+                span_action_l1 = float(np.mean(action_values))
+                type_action_values[label].append(span_action_l1)
+                pattern_action_values[(pattern_key, span_idx, label)].append(span_action_l1)
 
         if episode_had_span_loss:
             contributing_episodes += 1
 
     metrics: dict[str, float] = {
         "segment_val_episodes": float(contributing_episodes),
-        "segment_val_frames": float(len(frame_action_counts)),
+        "segment_val_frames": float(len(frame_ce_counts)),
     }
 
-    for label, values in type_action_values.items():
-        metrics[f"segment_type/{label}/action_l1"] = float(np.mean(values))
     for label, values in type_ce_values.items():
         metrics[f"segment_type/{label}/label_ce"] = float(np.mean(values))
-
-    for (pattern_key, span_idx, label), values in pattern_action_values.items():
-        metrics[f"pattern/{pattern_key}/span{span_idx}_{label}/action_l1"] = float(np.mean(values))
     for (pattern_key, span_idx, label), values in pattern_ce_values.items():
         metrics[f"pattern/{pattern_key}/span{span_idx}_{label}/label_ce"] = float(np.mean(values))
+    if include_action_l1:
+        for label, values in type_action_values.items():
+            metrics[f"segment_type/{label}/action_l1"] = float(np.mean(values))
+        for (pattern_key, span_idx, label), values in pattern_action_values.items():
+            metrics[f"pattern/{pattern_key}/span{span_idx}_{label}/action_l1"] = float(np.mean(values))
 
     return metrics
 
@@ -403,6 +409,7 @@ def compute_offline_val_segment_loss(
     camera_keys: list[str],
     episode_spans: EpisodeSpanTable,
     label_delta_indices: list[int],
+    include_action_l1: bool = True,
 ) -> dict[str, float]:
     """Run segment-aware validation and return MP/L span and pattern metrics."""
     unwrapped = accelerator.unwrap_model(policy)
@@ -459,8 +466,9 @@ def compute_offline_val_segment_loss(
                         frame_ce_counts,
                         episode_index=episode_index,
                         local_frame=local_frame,
-                        action_l1=float(action_l1[row, step_idx].item()),
+                        action_l1=float(action_l1[row, step_idx].item()) if include_action_l1 else 0.0,
                         label_ce=float(label_ce[row, step_idx].item()),
+                        include_action_l1=include_action_l1,
                     )
 
     if was_training:
@@ -472,6 +480,7 @@ def compute_offline_val_segment_loss(
         frame_action_counts,
         frame_ce_sums,
         frame_ce_counts,
+        include_action_l1=include_action_l1,
     )
     metrics["segment_val_s"] = time.perf_counter() - start_time
     return metrics

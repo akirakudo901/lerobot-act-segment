@@ -19,7 +19,7 @@
 
 from dataclasses import dataclass
 
-from hybrid_eval.segment.configuration_segment import SegmentPolicyConfigMixin
+from hybrid_eval.segment.configuration_segment import SegmentLabelConfigMixin
 
 from lerobot.configs import PreTrainedConfig
 
@@ -28,12 +28,11 @@ from ..act.configuration_act import ACTConfig
 
 @PreTrainedConfig.register_subclass("act_label")
 @dataclass
-class ACTLabelConfig(ACTConfig, SegmentPolicyConfigMixin):
+class ACTLabelConfig(ACTConfig, SegmentLabelConfigMixin):
     """Small ACT that classifies per-chunk BIO labels (CE only, no VAE).
 
-    Hybrid rollout knobs come along with :class:`SegmentPolicyConfigMixin` so CE
-    weights and ``frame_label_int`` chunking match ``act_segment``. This policy
-    does not run the hybrid orchestrator.
+    Label CE knobs come from :class:`SegmentLabelConfigMixin`. This policy is not
+    a hybrid rollout policy and does not mix in :class:`SegmentPolicyConfigMixin`.
     """
 
     dim_model: int = 256

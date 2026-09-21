@@ -71,7 +71,7 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
-from hybrid_eval.segment import is_segment_policy_config
+from hybrid_eval.segment import is_label_chunk_config, is_label_only_config, is_segment_policy_config
 
 from .lerobot_eval import _configure_act_segment_rollout_processors, eval_policy_all
 
@@ -312,7 +312,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
     eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
+    if (
+        cfg.eval_freq > 0
+        and cfg.env is not None
+        and is_main_process
+        and not is_label_only_config(cfg.policy)
+    ):
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
@@ -476,7 +481,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if val_episodes_resolved is None and is_main_process:
             n_val = len(val_dataset.episodes) if val_dataset.episodes is not None else val_dataset.num_episodes
             logging.info(f"Offline val dataset loaded: val_episodes={n_val}")
-        if is_segment_policy_config(cfg.policy):
+        if is_label_chunk_config(cfg.policy):
             label_feature_key = getattr(cfg.policy, "label_feature_key", "frame_label_int")
             val_episode_spans = build_episode_span_tables(
                 val_dataset,
@@ -672,7 +677,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     accelerator=accelerator,
                     camera_keys=dataset.meta.camera_keys,
                 )
-                if is_segment_policy_config(cfg.policy) and val_episode_spans is not None:
+                if is_label_chunk_config(cfg.policy) and val_episode_spans is not None:
                     segment_metrics = compute_offline_val_segment_loss(
                         policy=policy,
                         val_dataloader=val_dataloader,
@@ -682,6 +687,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         camera_keys=dataset.meta.camera_keys,
                         episode_spans=val_episode_spans,
                         label_delta_indices=cfg.policy.label_delta_indices,
+                        include_action_l1=is_segment_policy_config(cfg.policy),
                     )
                     val_metrics.update(segment_metrics)
                 metrics_str = " ".join(
@@ -693,7 +699,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_logger.log_dict(val_metrics, step, mode="val")
             accelerator.wait_for_everyone()
 
-        if cfg.env and is_eval_step:
+        if cfg.env and is_eval_step and eval_env is not None:
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")

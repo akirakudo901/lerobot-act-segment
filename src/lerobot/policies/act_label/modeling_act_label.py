@@ -98,13 +98,11 @@ class ACTLabelPolicy(ACTPolicy):
         _actions, labels_logits, _vae_params = self.model(batch)
         return labels_logits.argmax(dim=-1)
 
-    @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Unused action trunk output (kept so ACT inference helpers still unpack)."""
-        self.eval()
-        batch = self._prepare_batch(batch)
-        actions, _labels_logits, _vae_params = self.model(batch)
-        return actions
+        """Label-only: the action trunk is not a supported inference output."""
+        raise NotImplementedError(
+            "act_label does not support action outputs; use predict_label_chunk."
+        )
 
     @torch.no_grad()
     def per_step_val_losses(
