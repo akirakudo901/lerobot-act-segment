@@ -101,7 +101,21 @@ def resolve_train_val_episodes(
     return episode_pool, None
 
 
-def relative_episode_spans(dataset: "LeRobotDataset") -> tuple[list[int], list[int]]:
+def _as_mp_aug_ready_train_dataset(dataset: object):
+    """Return ``dataset`` if it is :class:`MpAugReadyTrainDataset`, else ``None``."""
+    try:
+        from dataset.loaders.mp_aug_ready_train_dataset import MpAugReadyTrainDataset
+    except ImportError:
+        return None
+    if isinstance(dataset, MpAugReadyTrainDataset):
+        return dataset
+    return None
+
+
+def relative_episode_spans(
+    dataset: "LeRobotDataset",
+    drop_n_last_frames: int = 0,
+) -> tuple[list[int], list[int]]:
     """Episode start/end indices for :class:`~lerobot.datasets.sampler.EpisodeAwareSampler`.
 
     ``LeRobotDataset.__getitem__`` takes a *relative* row index into the loaded
@@ -113,13 +127,16 @@ def relative_episode_spans(dataset: "LeRobotDataset") -> tuple[list[int], list[i
     Unloaded episodes keep a zero-length ``(0, 0)`` placeholder so the lists
     stay aligned with original episode indices 0..N-1.
 
-    Augmentation-ready wrappers expose ``dataloader_episode_spans()`` because
-    they are not ``LeRobotDataset`` instances (no ``_ensure_reader``) and
-    ``__getitem__`` indexes sampleable virtual frames, not the base HF table.
+    :class:`~dataset.loaders.mp_aug_ready_train_dataset.MpAugReadyTrainDataset`
+    is not a ``LeRobotDataset``; it maps virtual-wrapper spans onto sampleable
+    ``__getitem__`` indices. ``drop_n_last_frames`` is applied in full wrapper
+    coordinates (queryable frames plus query-masked pads).
     """
-    spans_fn = getattr(dataset, "dataloader_episode_spans", None)
-    if callable(spans_fn):
-        return spans_fn()
+    mp_dataset = _as_mp_aug_ready_train_dataset(dataset)
+    if mp_dataset is not None:
+        return mp_dataset.dataloader_episode_spans(
+            drop_n_last_frames=int(drop_n_last_frames)
+        )
 
     from_abs = [int(x) for x in dataset.meta.episodes["dataset_from_index"]]
     to_abs = [int(x) for x in dataset.meta.episodes["dataset_to_index"]]
@@ -144,6 +161,24 @@ def relative_episode_spans(dataset: "LeRobotDataset") -> tuple[list[int], list[i
         rel_from.append(mapping[start])
         rel_to.append(mapping[last] + 1)
     return rel_from, rel_to
+
+
+def resolve_episode_aware_sampler_spans(
+    dataset: "LeRobotDataset",
+    drop_n_last_frames: int = 0,
+) -> tuple[list[int], list[int], int]:
+    """Return ``(from, to, sampler_drop)`` for :class:`~lerobot.datasets.sampler.EpisodeAwareSampler`.
+
+    :class:`~dataset.loaders.mp_aug_ready_train_dataset.MpAugReadyTrainDataset`
+    applies ``drop_n_last_frames`` on the full virtual episode inside
+    ``dataloader_episode_spans``. The sampler must then use ``drop=0`` so the
+    last queryable hops are not dropped a second time. Vanilla
+    ``LeRobotDataset`` spans stay untrimmed; the sampler still applies drop.
+    """
+    drop = int(drop_n_last_frames)
+    from_idx, to_idx = relative_episode_spans(dataset, drop_n_last_frames=drop)
+    sampler_drop = 0 if _as_mp_aug_ready_train_dataset(dataset) is not None else drop
+    return from_idx, to_idx, sampler_drop
 
 
 def compute_offline_val_loss(

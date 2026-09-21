@@ -39,6 +39,7 @@ from lerobot.common.offline_eval_utils import (
     episode_pattern,
     local_frame_to_span_idx,
     relative_episode_spans,
+    resolve_episode_aware_sampler_spans,
     split_episode_indices,
 )
 from lerobot.configs.default import DatasetConfig
@@ -117,15 +118,12 @@ def test_relative_episode_spans_identity_without_filter(tmp_path):
     assert rel_to == abs_to
     assert rel_to[-1] == len(dataset)
 
-
-def test_relative_episode_spans_uses_wrapper_dataloader_spans():
-    class Wrapper:
-        def dataloader_episode_spans(self):
-            return [0, 4], [4, 7]
-
-    rel_from, rel_to = relative_episode_spans(Wrapper())
-    assert rel_from == [0, 4]
-    assert rel_to == [4, 7]
+    from_idx, to_idx, sampler_drop = resolve_episode_aware_sampler_spans(
+        dataset, drop_n_last_frames=7
+    )
+    assert from_idx == abs_from
+    assert to_idx == abs_to
+    assert sampler_drop == 7
 
 
 def test_relative_episode_spans_for_episode_subset(tmp_path):

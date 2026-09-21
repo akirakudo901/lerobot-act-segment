@@ -41,7 +41,7 @@ from lerobot.common.offline_eval_utils import (
     build_episode_span_tables,
     compute_offline_val_loss,
     compute_offline_val_segment_loss,
-    relative_episode_spans,
+    resolve_episode_aware_sampler_spans,
     resolve_train_val_episodes,
 )
 from lerobot.common.train_utils import (
@@ -483,12 +483,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 label_feature_key=label_feature_key,
             )
         if hasattr(active_cfg, "drop_n_last_frames"):
-            val_from_idx, val_to_idx = relative_episode_spans(val_dataset)
+            val_from_idx, val_to_idx, val_sampler_drop = resolve_episode_aware_sampler_spans(
+                val_dataset,
+                drop_n_last_frames=active_cfg.drop_n_last_frames,
+            )
             val_sampler = EpisodeAwareSampler(
                 val_from_idx,
                 val_to_idx,
                 episode_indices_to_use=val_dataset.episodes,
-                drop_n_last_frames=active_cfg.drop_n_last_frames,
+                drop_n_last_frames=val_sampler_drop,
                 shuffle=False,
             )
         else:
@@ -510,12 +513,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # create dataloader for offline training
     if hasattr(active_cfg, "drop_n_last_frames"):
         shuffle = False
-        train_from_idx, train_to_idx = relative_episode_spans(dataset)
+        train_from_idx, train_to_idx, train_sampler_drop = resolve_episode_aware_sampler_spans(
+            dataset,
+            drop_n_last_frames=active_cfg.drop_n_last_frames,
+        )
         sampler = EpisodeAwareSampler(
             train_from_idx,
             train_to_idx,
             episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=active_cfg.drop_n_last_frames,
+            drop_n_last_frames=train_sampler_drop,
             shuffle=True,
         )
     else:
