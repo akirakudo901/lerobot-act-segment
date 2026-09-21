@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -39,13 +38,7 @@ from hybrid_eval.segment.losses import (
     mp_l_action_masks,
     segment_label_ce,
 )
-from hybrid_eval.segment import rollout_wrapper as _segment_rollout_mod
-from hybrid_eval.segment.rollout_wrapper import (
-    HybridChunkTelemetry,
-    HybridStepTelemetry,
-    IkPending,
-    SegmentRolloutWrapper,
-)
+from hybrid_eval.segment.policy_mixin import SegmentRolloutPolicyMixin
 from .configuration_act_segment import ACTSegmentConfig
 
 
@@ -69,7 +62,7 @@ class ACTSegment(ACT):
         return actions, labels_logits, vae_params
 
 
-class ACTSegmentPolicy(ACTPolicy):
+class ACTSegmentPolicy(SegmentRolloutPolicyMixin, ACTPolicy):
     """ACT policy with auxiliary BIO segment-label cross-entropy loss."""
 
     config_class = ACTSegmentConfig
@@ -89,38 +82,8 @@ class ACTSegmentPolicy(ACTPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
-        dataset_meta = kwargs.get("dataset_meta")
-        dataset_root = getattr(dataset_meta, "root", None) if dataset_meta is not None else None
-        self._segment_rollout = SegmentRolloutWrapper(
-            self,
-            config,
-            dataset_root=dataset_root,
-            pretrained_path=config.pretrained_path,
-        )
+        self._init_segment_rollout(config, **kwargs)
         self.reset()
-
-    def __getattr__(self, name: str) -> Any:
-        """Forward hybrid orchestrator state to the composed rollout wrapper.
-
-        Lets eval hooks and existing tests keep reading ``policy._connector``,
-        ``policy._chunk_t``, ``policy._ompl_trackers``, etc. Falls through to
-        ``nn.Module.__getattr__`` for registered parameters / submodules.
-        """
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            pass
-        if name == "_segment_rollout":
-            raise AttributeError(name)
-        try:
-            rollout = object.__getattribute__(self, "_segment_rollout")
-        except AttributeError as exc:
-            raise AttributeError(
-                f"{type(self).__name__!r} object has no attribute {name!r}"
-            ) from exc
-        if hasattr(rollout, name):
-            return getattr(rollout, name)
-        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def reset(self):
         """Clear ACT queues and hybrid orchestrator chunk state."""
@@ -129,65 +92,6 @@ class ACTSegmentPolicy(ACTPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self._segment_rollout.reset()
-
-    def set_rollout_action_processors(
-        self,
-        postprocessor: Any | None,
-        *,
-        mp_rescaling_ctx: Any | None = _segment_rollout_mod._UNSET_MP_RESCALING_CTX,
-    ) -> None:
-        """Attach eval-time action postprocessing used inside :meth:`select_action`."""
-        self._segment_rollout.set_rollout_action_processors(
-            postprocessor, mp_rescaling_ctx=mp_rescaling_ctx
-        )
-
-    def set_dummy_action(self, action: Sequence[float] | None) -> None:
-        """Override the no-op action used for ``ik_pose_setter`` MP trigger frames."""
-        self._segment_rollout.set_dummy_action(action)
-
-    def bind_eval_env(self, env: Any | None) -> None:
-        """Associate this policy with a VectorEnv for hybrid MP (Layer-1 OMPL RPC)."""
-        self._segment_rollout.bind_eval_env(env)
-
-    def set_rollout_step(self, step: int) -> None:
-        """Set the current episode step index (used for chunk anchor bookkeeping)."""
-        self._segment_rollout.set_rollout_step(step)
-
-    def consume_ik_pending(self) -> IkPending | None:
-        """Return and clear IK targets from the last ``select_action`` call."""
-        return self._segment_rollout.consume_ik_pending()
-
-    def consume_ompl_torque_actions(self) -> list[Any | None]:
-        """Return and clear 8-D ``JOINT_TORQUE`` actions from the last ``select_action``."""
-        return self._segment_rollout.consume_ompl_torque_actions()
-
-    def set_collect_tracker_traces(self, rows: Sequence[int] | None) -> None:
-        """Enable Layer-2 tracker traces for VectorEnv rows (eval spline/waypoint viz)."""
-        self._segment_rollout.set_collect_tracker_traces(rows)
-
-    def collecting_tracker_traces(self) -> bool:
-        """True when at least one VectorEnv row will record Layer-2 tracker traces."""
-        return self._segment_rollout.collecting_tracker_traces()
-
-    def consume_ompl_tracker_traces(self) -> list[list[Any]]:
-        """Return and clear per-row Layer-2 tracker traces from the last episode."""
-        return self._segment_rollout.consume_ompl_tracker_traces()
-
-    def consume_hybrid_step_telemetry(self) -> list[HybridStepTelemetry | None]:
-        """Return and clear per-row telemetry from the last ``select_action`` call."""
-        return self._segment_rollout.consume_hybrid_step_telemetry()
-
-    def snapshot_ompl_episode_failures(self) -> list[dict[str, Any] | None]:
-        """Per-row last OMPL failure for the current episode (does not clear)."""
-        return self._segment_rollout.snapshot_ompl_episode_failures()
-
-    def pop_completed_chunks(self) -> list[HybridChunkTelemetry]:
-        """Return and clear policy chunks completed since the last pop."""
-        return self._segment_rollout.pop_completed_chunks()
-
-    def finalize_rollout_chunks(self) -> list[HybridChunkTelemetry]:
-        """Emit any in-progress chunks at episode end (call before ``reset``)."""
-        return self._segment_rollout.finalize_rollout_chunks()
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.image_features:
