@@ -17,29 +17,32 @@
 # IMPLEMENTED BY akirakudo901 for the hybrid-motion-planner project
 # see: https://github.com/akirakudo901/lerobot-act-segment
 
-"""ACT with a per-chunk-step segment label classification head."""
+"""Small ACT with a per-chunk-step BIO label head and no action / VAE loss."""
 
 from __future__ import annotations
+
+from collections import deque
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from ..act.configuration_act import ACTConfig
-from ..act.hybrid_act import HybridACTPolicy
-from ..act.modeling_act import ACT
+from lerobot.utils.constants import OBS_IMAGES
+
+from ..act.modeling_act import ACT, ACTPolicy, ACTTemporalEnsembler
+from ..pretrained import PreTrainedPolicy
 from hybrid_eval.segment.losses import (
     label_targets,
     label_valid_mask,
     segment_label_ce,
 )
-from .configuration_act_segment import ACTSegmentConfig
+from .configuration_act_label import ACTLabelConfig
 
 
-class ACTSegment(ACT):
-    """ACT decoder extended with a linear label head on decoder tokens."""
+class ACTLabel(ACT):
+    """ACT decoder with a linear label head; action outputs are unused in the train loss."""
 
-    def __init__(self, config: ACTSegmentConfig):
+    def __init__(self, config: ACTLabelConfig):
         super().__init__(config)
         self.label_head = nn.Linear(config.dim_model, config.num_label_classes)
 
@@ -49,28 +52,43 @@ class ACTSegment(ACT):
         sample_encoded_dist: bool = False,
         sample_latent_prior: bool = False,
     ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        actions, vae_params, decoder_out = self._forward_from_batch(
+        _actions, vae_params, decoder_out = self._forward_from_batch(
             batch, sample_encoded_dist, sample_latent_prior=sample_latent_prior
         )
         labels_logits = self.label_head(decoder_out)
-        return actions, labels_logits, vae_params
+        return _actions, labels_logits, vae_params
 
 
-class ACTSegmentPolicy(HybridACTPolicy):
-    """ACT policy with auxiliary BIO segment-label cross-entropy loss."""
+class ACTLabelPolicy(ACTPolicy):
+    """ACT policy trained with BIO label cross-entropy only."""
 
-    config_class = ACTSegmentConfig
-    name = "act_segment"
+    config_class = ACTLabelConfig
+    name = "act_label"
 
-    def _build_model(self, config: ACTConfig) -> ACTSegment:
-        return ACTSegment(config)  # type: ignore[arg-type]
+    def __init__(self, config: ACTLabelConfig, **kwargs):
+        PreTrainedPolicy.__init__(self, config)
+        config.validate_features()
+        self.config = config
+        self.model = ACTLabel(config)
 
-    @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        self.eval()
-        batch = self._prepare_batch(batch)
-        actions, _labels_logits, _vae_params = self.model(batch)
-        return actions
+        if config.temporal_ensemble_coeff is not None:
+            self.temporal_ensembler = ACTTemporalEnsembler(
+                config.temporal_ensemble_coeff, config.chunk_size
+            )
+
+        self.reset()
+
+    def reset(self):
+        if self.config.temporal_ensemble_coeff is not None:
+            self.temporal_ensembler.reset()
+        else:
+            self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+    def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        return batch
 
     @torch.no_grad()
     def predict_label_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -80,22 +98,11 @@ class ACTSegmentPolicy(HybridACTPolicy):
         _actions, labels_logits, _vae_params = self.model(batch)
         return labels_logits.argmax(dim=-1)
 
-    @torch.no_grad()
-    def predict_action_label_chunk(
-        self,
-        batch: dict[str, Tensor],
-        *,
-        sample_latent_prior: bool = False,
-        **kwargs,
-    ) -> tuple[Tensor, Tensor]:
-        """Return both the actions and argmax segment labels for each step in the predicted chunk."""
-        del kwargs
-        self.eval()
-        batch = self._prepare_batch(batch)
-        actions, labels_logits, _vae_params = self.model(
-            batch, sample_latent_prior=sample_latent_prior
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Label-only: the action trunk is not a supported inference output."""
+        raise NotImplementedError(
+            "act_label does not support action outputs; use predict_label_chunk."
         )
-        return actions, labels_logits.argmax(dim=-1)
 
     @torch.no_grad()
     def per_step_val_losses(
@@ -103,19 +110,25 @@ class ACTSegmentPolicy(HybridACTPolicy):
         batch: dict[str, Tensor],
         sample_encoded_dist: bool | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Return per-chunk-step action L1 and label CE for offline segment validation."""
+        """Return per-chunk-step label CE for offline validation.
+
+        ``action_l1`` is zeros: this policy has no action loss. ``valid_mask`` is
+        the label pad mask so span aggregation can still group CE by MP/L type.
+        """
         batch = self._prepare_batch(batch)
         sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
-        actions_hat, labels_logits, _vae_params = self.model(batch, sample_encoded_dist)
+        _actions_hat, labels_logits, _vae_params = self.model(batch, sample_encoded_dist)
 
-        action_l1, valid_mask = self._per_step_action_l1(batch, actions_hat)
         targets = label_targets(batch, self.config.label_feature_key)
+        valid_labels = label_valid_mask(batch, self.config.label_feature_key)
         per_step_ce = F.cross_entropy(
             labels_logits.reshape(-1, self.config.num_label_classes),
             targets.reshape(-1),
             reduction="none",
         ).view(labels_logits.shape[0], labels_logits.shape[1])
-        return action_l1, per_step_ce, valid_mask
+
+        action_l1 = torch.zeros_like(per_step_ce)
+        return action_l1, per_step_ce, valid_labels
 
     def forward(
         self,
@@ -124,9 +137,8 @@ class ACTSegmentPolicy(HybridACTPolicy):
     ) -> tuple[Tensor, dict]:
         batch = self._prepare_batch(batch)
         sample_encoded_dist = self._resolve_sample_encoded_dist(batch, sample_encoded_dist)
-        actions_hat, labels_logits, vae_params = self.model(batch, sample_encoded_dist)
+        _actions_hat, labels_logits, _vae_params = self.model(batch, sample_encoded_dist)
 
-        weighted_l1_loss, loss_dict = self._weighted_action_l1(batch, actions_hat)
         targets = label_targets(batch, self.config.label_feature_key)
         valid_labels = label_valid_mask(batch, self.config.label_feature_key)
         weighted_label_ce_loss, label_loss_dict = segment_label_ce(
@@ -137,7 +149,4 @@ class ACTSegmentPolicy(HybridACTPolicy):
             l_ce_weight=self.config.l_ce_weight,
             num_label_classes=self.config.num_label_classes,
         )
-        loss_dict.update(label_loss_dict)
-        return self._maybe_add_kld(
-            weighted_l1_loss + weighted_label_ce_loss, loss_dict, vae_params
-        )
+        return weighted_label_ce_loss, label_loss_dict

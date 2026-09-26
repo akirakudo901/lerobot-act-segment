@@ -48,7 +48,9 @@ from lerobot.utils.constants import (
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
+from .act_label.configuration_act_label import ACTLabelConfig
 from .act_segment.configuration_act_segment import ACTSegmentConfig
+from .act_segment_cond.configuration_act_segment_cond import ACTSegmentCondConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .diffusion_segment.configuration_diffusion_segment import DiffusionSegmentConfig
 from .eo1.configuration_eo1 import EO1Config
@@ -118,10 +120,18 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "act_label":
+        from .act_label.modeling_act_label import ACTLabelPolicy
+
+        return ACTLabelPolicy
     elif name == "act_segment":
         from .act_segment.modeling_act_segment import ACTSegmentPolicy
 
         return ACTSegmentPolicy
+    elif name == "act_segment_cond":
+        from .act_segment_cond.modeling_act_segment_cond import ACTSegmentCondPolicy
+
+        return ACTSegmentCondPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -204,8 +214,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionSegmentConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
+    elif policy_type == "act_label":
+        return ACTLabelConfig(**kwargs)
     elif policy_type == "act_segment":
         return ACTSegmentConfig(**kwargs)
+    elif policy_type == "act_segment_cond":
+        return ACTSegmentCondConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -312,11 +326,20 @@ def make_pre_post_processors(
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
         segment_prepend_state_layout_step = None
-        if isinstance(policy_cfg, ACTSegmentConfig):
+        if isinstance(policy_cfg, ACTLabelConfig):
+            # Saved act_label preprocessors reuse act_segment registry steps.
+            from .act_label.processor_act_label import (
+                prepend_act_label_state_layout_step as segment_prepend_state_layout_step,
+            )
+        elif isinstance(policy_cfg, ACTSegmentConfig):
             # Saved act_segment preprocessors may reference custom registry steps
             # (e.g. efficient_libero_state_reorder); import before from_pretrained.
             from .act_segment.processor_act_segment import (
                 prepend_act_segment_state_layout_step as segment_prepend_state_layout_step,
+            )
+        elif isinstance(policy_cfg, ACTSegmentCondConfig):
+            from .act_segment_cond.processor_act_segment_cond import (
+                prepend_act_segment_cond_state_layout_step as segment_prepend_state_layout_step,
             )
         elif isinstance(policy_cfg, DiffusionSegmentConfig):
             from .diffusion_segment.processor_diffusion_segment import (
@@ -373,10 +396,28 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, ACTLabelConfig):
+        from .act_label.processor_act_label import make_act_label_pre_post_processors
+
+        processors = make_act_label_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, ACTSegmentConfig):
         from .act_segment.processor_act_segment import make_act_segment_pre_post_processors
 
         processors = make_act_segment_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ACTSegmentCondConfig):
+        from .act_segment_cond.processor_act_segment_cond import (
+            make_act_segment_cond_pre_post_processors,
+        )
+
+        processors = make_act_segment_cond_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

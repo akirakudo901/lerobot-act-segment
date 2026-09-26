@@ -27,32 +27,17 @@ from hybrid_eval.segment.configuration_segment import (
 from lerobot.configs import PreTrainedConfig
 
 from ..act.configuration_act import ACTConfig
+from ..act.configuration_hybrid_act import ACTHybridConfigMixin
 
 
 @PreTrainedConfig.register_subclass("act_segment")
 @dataclass
-class ACTSegmentConfig(ACTConfig, SegmentPolicyConfigMixin):
+class ACTSegmentConfig(ACTConfig, SegmentPolicyConfigMixin, ACTHybridConfigMixin):
     """ACT with an auxiliary per-chunk-step MP/L BIO label head.
 
     Hybrid rollout + segment CE knobs come from :class:`SegmentPolicyConfigMixin`.
-    Fields below are ACT-specific (action L1 reweighting, VAE retry sampling, processors).
+    Action L1 / preprocessor knobs come from :class:`ACTHybridConfigMixin`.
     """
-
-    # Scales the MP execution-frame L1 term: weighted_l1 = l_l1_loss + mp_l1_weight * mp_l1_loss.
-    mp_l1_weight: float = 1.0
-    # On requery refill, sample ACT latent from N(0, I) instead of the deterministic zero vector.
-    ompl_retry_sample_latent: bool = True
-
-    # Reorder ``observation.state`` in the policy preprocessor to match the training dataset layout.
-    # Default ``None``: no reordering. Set explicitly when eval env layout differs from training:
-    # ``lerobot`` for datasets with ee_pos + ee_ori + gripper (no reorder step),
-    # ``efficient_libero`` for legacy efficient exports (gripper + ee_pos + ee_ori).
-    observation_state_layout: str | None = None
-
-    @property
-    def label_delta_indices(self) -> list[int]:
-        return list(range(self.chunk_size))
-
 
 def _patch_pretrained_ompl_cli_overrides() -> None:
     """Rewrite legacy ``--ompl_*`` CLI overrides when loading a pretrained policy."""

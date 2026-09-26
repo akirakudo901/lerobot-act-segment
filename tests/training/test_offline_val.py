@@ -376,6 +376,28 @@ def test_aggregate_segment_val_metrics():
     assert metrics["pattern/MP-L/span1_L/label_ce"] == pytest.approx(0.6)
 
 
+def test_aggregate_segment_val_metrics_label_ce_only():
+    episode_spans = {0: [(0, 2, "MP"), (2, 4, "L")]}
+    frame_ce_sums = {(0, 0): 0.1, (0, 1): 0.3, (0, 2): 0.5, (0, 3): 0.7}
+    frame_ce_counts = {(0, 0): 1, (0, 1): 1, (0, 2): 1, (0, 3): 1}
+
+    metrics = aggregate_segment_val_metrics(
+        episode_spans,
+        {},
+        {},
+        frame_ce_sums,
+        frame_ce_counts,
+        include_action_l1=False,
+    )
+
+    assert metrics["segment_val_episodes"] == 1.0
+    assert metrics["segment_val_frames"] == 4.0
+    assert metrics["segment_type/MP/label_ce"] == pytest.approx(0.2)
+    assert metrics["segment_type/L/label_ce"] == pytest.approx(0.6)
+    assert "segment_type/MP/action_l1" not in metrics
+    assert "pattern/MP-L/span0_MP/action_l1" not in metrics
+
+
 def test_build_episode_span_tables(tmp_path):
     _dataset, root = make_dummy_segment_dataset(["camera1"], tmp_path)
     from lerobot.datasets.lerobot_dataset import LeRobotDataset

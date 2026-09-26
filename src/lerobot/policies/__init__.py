@@ -18,7 +18,9 @@
 from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
 
 from .act.configuration_act import ACTConfig as ACTConfig
+from .act_label.configuration_act_label import ACTLabelConfig
 from .act_segment.configuration_act_segment import ACTSegmentConfig
+from .act_segment_cond.configuration_act_segment_cond import ACTSegmentCondConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .diffusion_segment.configuration_diffusion_segment import DiffusionSegmentConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
@@ -45,7 +47,9 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     # Configuration classes
     "ACTConfig",
+    "ACTLabelConfig",
     "ACTSegmentConfig",
+    "ACTSegmentCondConfig",
     "DiffusionConfig",
     "DiffusionSegmentConfig",
     "EO1Config",
