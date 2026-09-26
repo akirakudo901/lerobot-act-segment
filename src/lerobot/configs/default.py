@@ -57,6 +57,17 @@ class DatasetConfig:
     # Dense-L: rewrite L-frame actions as EE pose-endpoint deltas at train time.
     # Does not change stored parquet; combine with any augmentation-ready export.
     relabel_l_as_pose_endpoint: bool = False
+    # Optional labels.jsonl override for MP aug-ready training. When unset, the
+    # wrapper joins labels from labels_version_root, meta/label_binding.json,
+    # export provenance, then parquet frame_label_int.
+    labels_jsonl: str | None = None
+    # ``labels/{label_version}/`` root for per-task ``<suite>/<stem>/labels.jsonl``.
+    labels_version_root: str | None = None
+    # Label version name (manifest / CLI). Used with layout to resolve JSONL.
+    label_version: str | None = None
+    # Drop stored demos whose JSONL row fails demo_label_matches (undecidable
+    # rows are kept). Ignored when no JSONL record is found.
+    require_matching_labels: bool = False
 
     def __post_init__(self) -> None:
         if self.episodes is not None:
