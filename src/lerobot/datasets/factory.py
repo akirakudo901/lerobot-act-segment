@@ -86,7 +86,7 @@ def _maybe_wrap_mp_aug_ready_dataset(
     logging.info(
         "Wrapping augmentation-ready dataset at %s "
         "(mp_shift_max=%d, augment=%s, last_l=%s n=%d, wp_cov=%s, "
-        "relabel_l_as_pose_endpoint=%s)",
+        "relabel_l_as_pose_endpoint=%s, labels_jsonl=%s, labels_version_root=%s)",
         dataset_root,
         dataset_cfg.mp_shift_max,
         enable_augmentation,
@@ -94,6 +94,8 @@ def _maybe_wrap_mp_aug_ready_dataset(
         dataset_cfg.last_l_n,
         enable_coverage,
         dataset_cfg.relabel_l_as_pose_endpoint,
+        dataset_cfg.labels_jsonl,
+        dataset_cfg.labels_version_root,
     )
     return wrap_mp_aug_ready_dataset(
         dataset,
@@ -108,6 +110,9 @@ def _maybe_wrap_mp_aug_ready_dataset(
         min_rescale_samples=dataset_cfg.mp_rescaling_min_samples,
         rescaling_registry_path=rescaling_registry_path,
         relabel_l_as_pose_endpoint=bool(dataset_cfg.relabel_l_as_pose_endpoint),
+        labels_jsonl=dataset_cfg.labels_jsonl,
+        labels_version_root=dataset_cfg.labels_version_root,
+        require_matching_labels=bool(dataset_cfg.require_matching_labels),
     )
 
 
@@ -160,6 +165,29 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def ensure_label_delta_timestamps(
+    delta_timestamps: dict[str, list] | None,
+    cfg: PreTrainedConfig | RewardModelConfig,
+    fps: float,
+) -> dict[str, list] | None:
+    """Add ``label_feature_key`` deltas even when the key is absent from parquet.
+
+    Used for MP aug-ready training that joins ``frame_label_int`` from JSONL.
+    """
+    label_feature_key = getattr(cfg, "label_feature_key", None)
+    label_delta_indices = getattr(cfg, "label_delta_indices", None)
+    if not label_feature_key or label_delta_indices is None:
+        return delta_timestamps
+    deltas = [i / fps for i in label_delta_indices]
+    if delta_timestamps is None:
+        return {str(label_feature_key): deltas}
+    if label_feature_key in delta_timestamps:
+        return delta_timestamps
+    out = dict(delta_timestamps)
+    out[str(label_feature_key)] = deltas
+    return out
+
+
 def make_dataset_from_config(
     dataset_cfg: DatasetConfig,
     trainable_config: PreTrainedConfig | RewardModelConfig,
@@ -187,6 +215,10 @@ def make_dataset_from_config(
             dataset_cfg.repo_id, root=dataset_cfg.root, revision=dataset_cfg.revision
         )
         delta_timestamps = resolve_delta_timestamps(trainable_config, ds_meta)
+        if dataset_cfg.enable_mp_aug_ready_transforms:
+            delta_timestamps = ensure_label_delta_timestamps(
+                delta_timestamps, trainable_config, ds_meta.fps
+            )
         if not dataset_cfg.streaming:
             dataset = LeRobotDataset(
                 dataset_cfg.repo_id,
