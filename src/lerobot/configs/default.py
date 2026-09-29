@@ -57,6 +57,11 @@ class DatasetConfig:
     # Dense-L: rewrite L-frame actions as EE pose-endpoint deltas at train time.
     # Does not change stored parquet; combine with any augmentation-ready export.
     relabel_l_as_pose_endpoint: bool = False
+    # Dense-execution label rewrite applied before virtual segments are built.
+    # ``none`` | ``all_l`` | ``mp_all_b`` | ``mp_all_e`` | ``mp_terminal_e``.
+    ablation_label_mode: str = "none"
+    # Last-k E-MP tail length. Used only when ablation_label_mode is mp_terminal_e.
+    ablation_terminal_e_k: int = 0
     # Optional labels.jsonl override for MP aug-ready training. When unset, the
     # wrapper joins labels from labels_version_root, meta/label_binding.json,
     # export provenance, then parquet frame_label_int.
