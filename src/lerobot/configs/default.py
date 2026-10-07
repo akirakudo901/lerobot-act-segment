@@ -57,6 +57,11 @@ class DatasetConfig:
     # Dense-L: rewrite L-frame actions as EE pose-endpoint deltas at train time.
     # Does not change stored parquet; combine with any augmentation-ready export.
     relabel_l_as_pose_endpoint: bool = False
+    # Handoff-rest virtual segments (MP→L pieces + hold frames + short L hops).
+    enable_handoff_rest_segments: bool = False
+    handoff_rest_frames: int = 0
+    handoff_l_max_hop_m: float = 0.0
+    handoff_l_prefix_hops: int = 0
     # Dense-execution label rewrite applied before virtual segments are built.
     # ``none`` | ``all_l`` | ``mp_all_b`` | ``mp_all_e`` | ``mp_terminal_e``.
     ablation_label_mode: str = "none"
@@ -95,6 +100,47 @@ class DatasetConfig:
                 "enable_intermediate_waypoint_coverage and MP-shift "
                 "(mp_shift_max > 0) are mutually exclusive"
             )
+        if self.enable_handoff_rest_segments:
+            if self.handoff_rest_frames < 1:
+                raise ValueError(
+                    "handoff_rest_frames must be >= 1 when "
+                    f"enable_handoff_rest_segments is true, got {self.handoff_rest_frames}"
+                )
+            if self.handoff_l_max_hop_m <= 0.0:
+                raise ValueError(
+                    "handoff_l_max_hop_m must be > 0 when "
+                    f"enable_handoff_rest_segments is true, got {self.handoff_l_max_hop_m}"
+                )
+            if self.handoff_l_prefix_hops < 1:
+                raise ValueError(
+                    "handoff_l_prefix_hops must be >= 1 when "
+                    f"enable_handoff_rest_segments is true, got {self.handoff_l_prefix_hops}"
+                )
+            if self.mp_shift_max > 0:
+                raise ValueError(
+                    "enable_handoff_rest_segments and MP-shift "
+                    "(mp_shift_max > 0) are mutually exclusive"
+                )
+            if self.enable_last_l_augmentation:
+                raise ValueError(
+                    "enable_handoff_rest_segments and last-L augmentation "
+                    "are mutually exclusive"
+                )
+            if not self.relabel_l_as_pose_endpoint:
+                raise ValueError(
+                    "enable_handoff_rest_segments requires dense L "
+                    "(relabel_l_as_pose_endpoint=True)"
+                )
+            if self.ablation_label_mode in ("all_l", "mp_all_e", "mp_terminal_e"):
+                raise ValueError(
+                    "enable_handoff_rest_segments is incompatible with "
+                    f"ablation_label_mode {self.ablation_label_mode!r}"
+                )
+            if self.rescale_mp_actions:
+                raise ValueError(
+                    "enable_handoff_rest_segments is incompatible with "
+                    "rescale_mp_actions"
+                )
 
 
 @dataclass

@@ -86,7 +86,8 @@ def _maybe_wrap_mp_aug_ready_dataset(
     logging.info(
         "Wrapping augmentation-ready dataset at %s "
         "(mp_shift_max=%d, augment=%s, last_l=%s n=%d, wp_cov=%s, "
-        "relabel_l_as_pose_endpoint=%s, ablation_label_mode=%s, "
+        "relabel_l_as_pose_endpoint=%s, handoff_rest=%s n=%d hop=%s x=%d, "
+        "ablation_label_mode=%s, "
         "ablation_terminal_e_k=%s, labels_jsonl=%s, labels_version_root=%s)",
         dataset_root,
         dataset_cfg.mp_shift_max,
@@ -95,6 +96,10 @@ def _maybe_wrap_mp_aug_ready_dataset(
         dataset_cfg.last_l_n,
         enable_coverage,
         dataset_cfg.relabel_l_as_pose_endpoint,
+        dataset_cfg.enable_handoff_rest_segments,
+        dataset_cfg.handoff_rest_frames,
+        dataset_cfg.handoff_l_max_hop_m,
+        dataset_cfg.handoff_l_prefix_hops,
         dataset_cfg.ablation_label_mode,
         dataset_cfg.ablation_terminal_e_k,
         dataset_cfg.labels_jsonl,
@@ -113,6 +118,10 @@ def _maybe_wrap_mp_aug_ready_dataset(
         min_rescale_samples=dataset_cfg.mp_rescaling_min_samples,
         rescaling_registry_path=rescaling_registry_path,
         relabel_l_as_pose_endpoint=bool(dataset_cfg.relabel_l_as_pose_endpoint),
+        enable_handoff_rest_segments=bool(dataset_cfg.enable_handoff_rest_segments),
+        handoff_rest_frames=int(dataset_cfg.handoff_rest_frames),
+        handoff_l_max_hop_m=float(dataset_cfg.handoff_l_max_hop_m),
+        handoff_l_prefix_hops=int(dataset_cfg.handoff_l_prefix_hops),
         ablation_label_mode=str(dataset_cfg.ablation_label_mode),
         ablation_terminal_e_k=int(dataset_cfg.ablation_terminal_e_k),
         labels_jsonl=dataset_cfg.labels_jsonl,
