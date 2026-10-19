@@ -707,17 +707,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 # only the first one below. Segment policies use hybrid-viz rendering
                 # (same as lerobot-eval-hybrid-viz) instead of plain third-person MP4s.
                 eval_videos_dir = cfg.output_dir / "eval" / f"videos_step_{step_id}"
-                use_hybrid_viz = is_segment_policy_config(cfg.policy)
-                eval_video_kwargs: dict[str, Any] = (
-                    {"hybrid_videos_dir": eval_videos_dir}
-                    if use_hybrid_viz
-                    else {"videos_dir": eval_videos_dir}
+                from lerobot.scripts.lerobot_eval import resolve_eval_video_dirs
+
+                videos_dir, hybrid_videos_dir = resolve_eval_video_dirs(
+                    cfg.policy,
+                    hybrid_videos_dir=eval_videos_dir,
                 )
-                if use_hybrid_viz:
+                eval_video_kwargs: dict[str, Any] = {}
+                if hybrid_videos_dir is not None:
+                    eval_video_kwargs["hybrid_videos_dir"] = hybrid_videos_dir
                     logging.info(
                         "Using hybrid-viz eval videos for segment policy (%s)",
                         cfg.policy.type,
                     )
+                elif videos_dir is not None:
+                    eval_video_kwargs["videos_dir"] = videos_dir
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
