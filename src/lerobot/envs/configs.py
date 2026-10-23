@@ -130,6 +130,14 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
         """Return (preprocessor, postprocessor) for this env. Default: identity."""
         return PolicyProcessorPipeline(steps=[]), PolicyProcessorPipeline(steps=[])
 
+    def align_controller_with_policy(self, policy_cfg: Any) -> None:
+        """Match gym action dim / controller to ``policy_cfg`` before ``make_env``.
+
+        Default is a no-op. Envs whose benchmark hardcodes a controller (e.g.
+        LIBERO OSC 7-D) override this so eval stays env-type-agnostic.
+        """
+        return
+
 
 @dataclass
 class HubEnvConfig(EnvConfig):
@@ -356,6 +364,13 @@ class LiberoEnv(EnvConfig):
         }
     )
     control_mode: str = "relative"  # or "absolute"
+    # ``libero_relative_ee7d`` (OSC 7-D) or ``libero_relative_joint8d``
+    # (``JOINT_POSITION`` 8-D). :meth:`align_controller_with_policy` also
+    # sets this from ``policy.mp_action_space`` / ``policy.l_action_space``.
+    action_space: str = "libero_relative_ee7d"
+    # JOINT_POSITION ``output_max`` (rad/tick). ``None`` uses robosuite default
+    # unless align copies ``osc_tracker.joint_output_max``.
+    joint_output_max: float | None = None
 
     def __post_init__(self):
         if self.obs_type == "pixels":
@@ -403,11 +418,43 @@ class LiberoEnv(EnvConfig):
         else:
             raise ValueError(f"Unsupported obs_type: {self.obs_type}")
 
+        if str(self.action_space) in {
+            "libero_relative_joint8d",
+            "joint8d",
+            "joint",
+            "JOINT_POSITION",
+        }:
+            self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(8,))
+
         if self.camera_name_mapping is not None:
             mapped_agentview = self.camera_name_mapping.get("agentview_image", "image")
             mapped_eye_in_hand = self.camera_name_mapping.get("robot0_eye_in_hand_image", "image2")
             self.features_map[LIBERO_KEY_PIXELS_AGENTVIEW] = f"{OBS_IMAGES}.{mapped_agentview}"
             self.features_map[LIBERO_KEY_PIXELS_EYE_IN_HAND] = f"{OBS_IMAGES}.{mapped_eye_in_hand}"
+
+    def align_controller_with_policy(self, policy_cfg: Any) -> None:
+        """Switch this LIBERO config to 8-D ``JOINT_POSITION`` when the policy is joint."""
+        from lerobot.envs.libero import is_libero_joint8d_action_space
+
+        env_joint = is_libero_joint8d_action_space(getattr(self, "action_space", None))
+        policy_joint = False
+        if policy_cfg is not None:
+            from hybrid_eval.orchestrator import HybridActionSpaces
+
+            spaces = HybridActionSpaces.from_config(policy_cfg)
+            policy_joint = bool(
+                spaces.mp_action_space.is_joint and spaces.l_action_space.is_joint
+            )
+        if not env_joint and not policy_joint:
+            return
+        self.action_space = "libero_relative_joint8d"
+        self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(8,))
+        if self.joint_output_max is None and policy_cfg is not None:
+            from hybrid_eval.osc_tracker_config import OscTrackerConfig
+
+            self.joint_output_max = float(
+                OscTrackerConfig.from_policy_config(policy_cfg).joint_output_max
+            )
 
     @property
     def gym_kwargs(self) -> dict:
@@ -416,7 +463,10 @@ class LiberoEnv(EnvConfig):
             "render_mode": self.render_mode,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "action_space": self.action_space,
         }
+        if self.joint_output_max is not None:
+            kwargs["joint_output_max"] = self.joint_output_max
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
         if self.task_names is not None:

@@ -48,6 +48,7 @@ from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.scripts.lerobot_eval import (
     _configure_act_segment_rollout_processors,
+    align_env_controller_with_policy,
     eval_policy_all,
     resolve_eval_video_dirs,
 )
@@ -70,6 +71,7 @@ def eval_hybrid_viz_main(cfg: EvalPipelineConfig):
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
     logging.info(f"Making environment (batch_size={cfg.eval.batch_size}, async={cfg.eval.use_async_envs}).")
+    align_env_controller_with_policy(cfg.env, cfg.policy)
     envs = make_env(
         cfg.env,
         n_envs=cfg.eval.batch_size,

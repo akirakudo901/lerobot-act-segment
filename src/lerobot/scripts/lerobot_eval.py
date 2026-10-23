@@ -166,17 +166,51 @@ def _uses_spline_torque_eval(cfg: Any) -> bool:
     return _uses_ompl_layer1_rpc(cfg) and _ompl_tracking_mode(cfg) == "timed_spline_torque"
 
 
+def _uses_spline_joint_eval(cfg: Any) -> bool:
+    return _uses_ompl_layer1_rpc(cfg) and _ompl_tracking_mode(cfg) == "timed_spline_joint"
+
+
+def policy_uses_joint_actions(cfg: Any) -> bool:
+    """True when MP and L codecs are both joint-space (layout-agnostic)."""
+    if cfg is None:
+        return False
+    from hybrid_eval.orchestrator import HybridActionSpaces
+
+    spaces = HybridActionSpaces.from_config(cfg)
+    return bool(spaces.mp_action_space.is_joint and spaces.l_action_space.is_joint)
+
+
+
+def align_env_controller_with_policy(env_cfg: Any, policy_cfg: Any) -> None:
+    """Dispatch to ``env_cfg.align_controller_with_policy`` before ``make_env``.
+
+    LIBERO's override switches OSC 7-D → ``JOINT_POSITION`` 8-D. Other
+    ``EnvConfig`` subclasses no-op until they implement the same method.
+    """
+    if env_cfg is None:
+        return
+    align = getattr(env_cfg, "align_controller_with_policy", None)
+    if callable(align):
+        align(policy_cfg)
+
+
+
 # Hybrid-motion-planner extension (akirakudo901)
 def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
     """Bind VectorEnv into act_segment for Layer-1 OMPL RPC and enable failure stills.
 
     Layer-2 tracking is ``policy.config.osc_tracker.tracking_mode``:
     ``waypoint`` (OSC toward geometric samples), ``timed_spline`` (cubic + OSC),
-    or ``timed_spline_torque`` (same cubic, then 8-D ``JOINT_TORQUE``). Pair
+    ``timed_spline_joint`` (cubic + 8-D ``JOINT_POSITION``), or
+    ``timed_spline_torque`` (same cubic, then 8-D ``JOINT_TORQUE``). Pair
     ``hybrid_connector=contiguous_mp_runs`` with the spline modes so hops share
     one cubic. Nested ``OmplPathPlannerConfig`` / ``OscTrackerConfig`` on the
     policy config are the source of truth (legacy flat ``ompl_*`` keys are
     lifted at load time). Also binds when ``l_executor_type='timed_spline_torque'``.
+    Joint policies use the env's base controller (see
+    :func:`align_env_controller_with_policy`); torque MP still swaps for the
+    MP span and restores that base. Hold dummy comes from
+    ``eval_hold_dummy_action`` when the worker implements it.
     """
     cfg = getattr(policy, "config", None)
     if cfg is None or not _uses_ompl_layer1_rpc(cfg):
@@ -186,12 +220,28 @@ def _configure_ompl_waypoints_rollout(policy: PreTrainedPolicy, env: gym.vector.
     if callable(bind):
         bind(env)
 
+    _bind_eval_hold_dummy_action(policy, env)
+
     # Inject mocap ghost / goal-marker in each worker so soft plan failures can
     # attach picklable PNG stills (see hybrid_mp_planning.plan_ompl).
     try:
         env.call("enable_ompl_failure_viz")
     except (AttributeError, NotImplementedError, TypeError):
         pass
+
+
+def _bind_eval_hold_dummy_action(policy: PreTrainedPolicy, env: gym.vector.VectorEnv) -> None:
+    """Copy the worker no-op action onto the policy when the env provides one."""
+    setter = getattr(policy, "set_dummy_action", None)
+    if not callable(setter):
+        return
+    try:
+        rows = list(env.call("eval_hold_dummy_action"))
+    except (AttributeError, NotImplementedError, TypeError):
+        return
+    dummy = next((row for row in rows if row is not None), None)
+    if dummy is not None:
+        setter(dummy)
 
 
 def _ompl_tracking_mode(cfg: Any) -> str:
@@ -343,10 +393,16 @@ def _attach_live_arm_dynamics_for_ompl(
     only needed when Layer-2 tracker figures will be written for the batch.
     """
     cfg = getattr(policy, "config", None)
-    if cfg is None or not _uses_spline_torque_eval(cfg):
+    if cfg is None:
         return
     collecting = getattr(policy, "collecting_tracker_traces", None)
-    if callable(collecting) and not collecting():
+    traces = bool(callable(collecting) and collecting())
+    need_q = (
+        policy_uses_joint_actions(cfg)
+        or _uses_spline_joint_eval(cfg)
+        or (_uses_spline_torque_eval(cfg) and traces)
+    )
+    if not need_q:
         return
     try:
         snapshots = list(env.call("arm_dynamics_snapshot"))
@@ -357,6 +413,8 @@ def _attach_live_arm_dynamics_for_ompl(
     observation["live_arm_qpos"] = torch.as_tensor(
         np.stack([np.asarray(s["qpos"], dtype=np.float64) for s in snapshots], axis=0)
     )
+    if not (_uses_spline_torque_eval(cfg) and traces):
+        return
     observation["live_arm_qvel"] = torch.as_tensor(
         np.stack([np.asarray(s["qvel"], dtype=np.float64) for s in snapshots], axis=0)
     )
@@ -1072,6 +1130,7 @@ def eval_main(cfg: EvalPipelineConfig):
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
     logging.info(f"Making environment (batch_size={cfg.eval.batch_size}, async={cfg.eval.use_async_envs}).")
+    align_env_controller_with_policy(cfg.env, cfg.policy)
     envs = make_env(
         cfg.env,
         n_envs=cfg.eval.batch_size,

@@ -121,16 +121,38 @@ def get_task_init_states(task_suite: Any, i: int, is_libero_plus: bool = False) 
     return torch.load(init_states_path, weights_only=False)  # nosec B614
 
 
-def get_libero_dummy_action():
-    """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
-    return [0, 0, 0, 0, 0, 0, -1]
-
-
 ACTION_DIM = 7
-# robosuite JOINT_TORQUE / SplineComputedTorqueController: 7 arm + 1 gripper
-TORQUE_ACTION_DIM = 8
+# robosuite JOINT_POSITION / JOINT_TORQUE: 7 arm + 1 gripper
+JOINT8_ACTION_DIM = 8
+TORQUE_ACTION_DIM = JOINT8_ACTION_DIM
 ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
+JOINT8D_ACTION_SPACE_NAMES = frozenset(
+    {
+        "libero_relative_joint8d",
+        "joint8d",
+        "joint",
+        "JOINT_POSITION",
+    }
+)
+
+
+def is_libero_joint8d_action_space(name: str | None) -> bool:
+    """True when eval should drive LIBERO with 8-D ``JOINT_POSITION`` actions."""
+    return str(name or "").strip() in JOINT8D_ACTION_SPACE_NAMES
+
+
+def get_libero_dummy_action(action_dim: int = ACTION_DIM):
+    """Get dummy/no-op action, used to roll out the simulation while the robot does nothing.
+
+    Gripper open (``-1``) is the last channel: index 6 on OSC 7-D, index 7 on
+    joint / torque 8-D.
+    """
+    dim = int(action_dim)
+    dummy = [0.0] * dim
+    if dim > 0:
+        dummy[-1] = -1.0
+    return dummy
 
 
 def coerce_action_for_libero_controller(
@@ -141,30 +163,34 @@ def coerce_action_for_libero_controller(
 ) -> np.ndarray:
     """Map a policy/vector-env action onto the live robosuite controller dim.
 
-    OSC is 7-D. Joint-torque swaps (including ``JOINT_TORQUE_SPLINE``) are 8-D
-    ``[arm (7), gripper]``. Do not key off the literal name ``JOINT_TORQUE``:
-    the spline controller uses ``JOINT_TORQUE_SPLINE`` and still expects 8.
+    OSC is 7-D. ``JOINT_POSITION`` and joint-torque swaps (including
+    ``JOINT_TORQUE_SPLINE``) are 8-D ``[arm (7), gripper]``. Do not key off
+    the literal name ``JOINT_TORQUE``: the spline controller uses
+    ``JOINT_TORQUE_SPLINE`` and still expects 8.
     """
     if action.ndim != 1:
         raise ValueError(
             f"Expected action to be 1-D (shape (action_dim,)), "
             f"but got shape {action.shape} with ndim={action.ndim}"
         )
-    torque_mode = int(env_action_dim) == TORQUE_ACTION_DIM or str(controller_name).startswith(
-        "JOINT_TORQUE"
+    name = str(controller_name)
+    eight_d = (
+        int(env_action_dim) == JOINT8_ACTION_DIM
+        or name.startswith("JOINT_TORQUE")
+        or name == "JOINT_POSITION"
     )
-    if torque_mode:
-        if action.shape[0] != TORQUE_ACTION_DIM:
+    if eight_d:
+        if action.shape[0] != JOINT8_ACTION_DIM:
             raise ValueError(
-                f"{controller_name or 'joint-torque controller'} expects an 8-D action "
+                f"{controller_name or '8-D joint controller'} expects an 8-D action "
                 f"[arm (7), gripper], got {action.shape}"
             )
         return action
-    if action.shape[0] == TORQUE_ACTION_DIM:
+    if action.shape[0] == JOINT8_ACTION_DIM:
         return action[:ACTION_DIM]
     if action.shape[0] != ACTION_DIM:
         raise ValueError(
-            f"Expected 1-D action of shape ({ACTION_DIM},) or ({TORQUE_ACTION_DIM},) "
+            f"Expected 1-D action of shape ({ACTION_DIM},) or ({JOINT8_ACTION_DIM},) "
             f"for OSC, got {action.shape}"
         )
     return action
@@ -202,6 +228,8 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         is_libero_plus: bool = False,
+        action_space: str = "libero_relative_ee7d",
+        joint_output_max: float | None = None,
     ):
         super().__init__()
         self.task_id = task_id
@@ -259,6 +287,11 @@ class LiberoEnv(gym.Env):
             else self.episode_length
         )
         self.control_mode = control_mode
+        self._joint8d = is_libero_joint8d_action_space(action_space)
+        self._joint_output_max = (
+            float(joint_output_max) if joint_output_max is not None else None
+        )
+        self._env_action_dim = JOINT8_ACTION_DIM if self._joint8d else ACTION_DIM
         # When True, Layer-1 OMPL soft failures capture blob/ghost PNG stills in-worker.
         self._ompl_failure_viz_enabled = False
         self._saved_arm_controller = None
@@ -322,7 +355,10 @@ class LiberoEnv(gym.Env):
             )
 
         self.action_space = spaces.Box(
-            low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
+            low=ACTION_LOW,
+            high=ACTION_HIGH,
+            shape=(self._env_action_dim,),
+            dtype=np.float32,
         )
 
     def _ensure_env(self) -> None:
@@ -343,6 +379,7 @@ class LiberoEnv(gym.Env):
         )
         env.reset()
         self._env = env
+        self._install_base_arm_controller()
 
     def render(self):
         self._ensure_env()
@@ -363,7 +400,9 @@ class LiberoEnv(gym.Env):
         eef_quat = raw_obs.get("robot0_eef_quat")
 
         # rotation matrix from controller
-        eef_mat = self._env.robots[0].controller.ee_ori_mat if eef_pos is not None else None
+        eef_mat = None
+        if eef_pos is not None:
+            eef_mat = getattr(self._env.robots[0].controller, "ee_ori_mat", None)
         gripper_qpos = raw_obs.get("robot0_gripper_qpos")
         gripper_qvel = raw_obs.get("robot0_gripper_qvel")
         joint_pos = raw_obs.get("robot0_joint_pos")
@@ -414,11 +453,15 @@ class LiberoEnv(gym.Env):
             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
             self.init_state_id += self._reset_stride  # Change init_state_id when reset
 
+        # Rebind JOINT_POSITION after reset / set_init_state (LIBERO rebuilds OSC).
+        self._install_base_arm_controller()
+
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
         # Increasing this value can improve determinism and reproducibility across resets.
+        dummy = get_libero_dummy_action(self._env_action_dim)
         for _ in range(self.num_steps_wait):
-            raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+            raw_obs, _, _, _ = self._env.step(dummy)
 
         if self.control_mode == "absolute":
             for robot in self._env.robots:
@@ -658,6 +701,16 @@ class LiberoEnv(gym.Env):
         self._ensure_env()
         enable_viz(self)
 
+    def eval_hold_dummy_action(self) -> list[float] | None:
+        """Worker RPC: no-op matching the live controller dim (joint-8D only).
+
+        Eval binds this onto the policy via ``set_dummy_action`` so hold steps
+        stay env-agnostic. OSC 7-D returns ``None`` (policy default dummy).
+        """
+        if not self._joint8d:
+            return None
+        return get_libero_dummy_action(self._env_action_dim)
+
     def _robosuite_sim_robot(self) -> tuple[Any, Any, Any]:
         self._ensure_env()
         assert self._env is not None
@@ -672,19 +725,28 @@ class LiberoEnv(gym.Env):
         return str(getattr(robot.controller, "name", "") or "")
 
     def _robosuite_action_dim(self) -> int:
-        """Cached robosuite ``action_dim`` (7 OSC, 8 after joint-torque swap)."""
+        """Cached robosuite ``action_dim`` (7 OSC, 8 after joint-position / torque)."""
         rs_env, _sim, robot = self._robosuite_sim_robot()
         inner = getattr(rs_env, "env", None)
         action_env = inner if inner is not None and hasattr(inner, "_action_dim") else rs_env
         return int(getattr(action_env, "_action_dim", robot.action_dim))
 
     def _action_for_current_controller(self, action: np.ndarray) -> np.ndarray:
-        """Accept 7-D OSC or 8-D torque; drop the pad dim on OSC rows."""
+        """Accept 7-D OSC or 8-D joint-position / torque; drop the pad dim on OSC rows."""
         return coerce_action_for_libero_controller(
             action,
             env_action_dim=self._robosuite_action_dim(),
             controller_name=self._controller_name(),
         )
+
+    @property
+    def live_arm_qpos(self) -> np.ndarray:
+        """Live Panda arm ``q`` for joint-8D Layer-1 OMPL (``plan_ompl_indexed``)."""
+        from hybrid_eval.execution.libero_qpos import get_arm_qpos
+
+        _rs_env, sim, robot = self._robosuite_sim_robot()
+        sim.forward()
+        return get_arm_qpos(sim, robot)
 
     def arm_dynamics_snapshot(self) -> dict[str, np.ndarray]:
         """Worker RPC: live arm q/qd/qdd and inertia for computed-torque Layer-2."""
@@ -737,8 +799,24 @@ class LiberoEnv(gym.Env):
         restore_arm_controller(rs_env, robot, self._saved_arm_controller)
         self._saved_arm_controller = None
 
+    def _install_base_arm_controller(self) -> None:
+        """Install ``JOINT_POSITION`` as the episode base controller when joint-8D."""
+        if not self._joint8d or self._env is None:
+            return
+        from hybrid_eval.execution.libero_controller_swap import (
+            install_joint_position_controller,
+        )
+
+        rs_env, _sim, robot = self._robosuite_sim_robot()
+        # Discard the saved OSC handle: torque swap restores this base, not OSC.
+        install_joint_position_controller(
+            rs_env, robot, output_max=self._joint_output_max
+        )
+        if hasattr(robot.controller, "use_delta"):
+            robot.controller.use_delta = self.control_mode == "relative"
+
     def restore_arm_controller(self) -> None:
-        """Restore the OSC controller saved by :meth:`install_joint_torque_controller`."""
+        """Restore the base controller saved by :meth:`install_joint_torque_controller`."""
         self._restore_arm_controller()
 
     def install_joint_torque_indexed(
@@ -755,7 +833,7 @@ class LiberoEnv(gym.Env):
         self.install_joint_torque_controller(kp=kp, kd=kd)
 
     def restore_arm_controller_indexed(self, mask: Sequence[bool]) -> None:
-        """Worker RPC: restore OSC when ``mask[episode_index]``."""
+        """Worker RPC: restore the base arm controller when ``mask[episode_index]``."""
         idx = int(self.episode_index)
         if idx < 0 or idx >= len(mask) or not mask[idx]:
             return
