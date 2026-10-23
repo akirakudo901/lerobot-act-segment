@@ -23,6 +23,9 @@ Uses the same metrics and rollout loop as :mod:`lerobot.scripts.lerobot_eval`, b
 MP4s with agentview + wrist cameras and predicted-label / chunk-boundary overlays from
 ``hybrid_eval.visualize`` instead of the default third-person-only render.
 
+Non-segment policies (vanilla ACT) fall back to plain ``videos_dir`` rendering, matching
+in-training eval. Hybrid live recording requires segment-policy telemetry.
+
 When ``policy.mp_executor_type=ompl_waypoints``, workers inject mocap ghost / goal-marker
 bodies and soft OMPL failures dump blob + ghost PNGs beside the hybrid videos.
 
@@ -43,7 +46,11 @@ from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.policies import make_policy, make_pre_post_processors
-from lerobot.scripts.lerobot_eval import _configure_act_segment_rollout_processors, eval_policy_all
+from lerobot.scripts.lerobot_eval import (
+    _configure_act_segment_rollout_processors,
+    eval_policy_all,
+    resolve_eval_video_dirs,
+)
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
@@ -90,6 +97,11 @@ def eval_hybrid_viz_main(cfg: EvalPipelineConfig):
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
     _configure_act_segment_rollout_processors(policy, cfg.policy, postprocessor)
 
+    videos_dir, hybrid_videos_dir = resolve_eval_video_dirs(
+        policy,
+        hybrid_videos_dir=Path(cfg.output_dir) / "videos",
+    )
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -100,7 +112,8 @@ def eval_hybrid_viz_main(cfg: EvalPipelineConfig):
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
             max_episodes_rendered=cfg.eval.max_episodes_rendered,
-            hybrid_videos_dir=Path(cfg.output_dir) / "videos",
+            videos_dir=videos_dir,
+            hybrid_videos_dir=hybrid_videos_dir,
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )

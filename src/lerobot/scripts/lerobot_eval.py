@@ -125,6 +125,32 @@ def _configure_act_segment_rollout_processors(policy: PreTrainedPolicy, policy_c
         set_processors(postprocessor)
 
 
+def resolve_eval_video_dirs(
+    policy: Any,
+    *,
+    videos_dir: Path | None = None,
+    hybrid_videos_dir: Path | None = None,
+) -> tuple[Path | None, Path | None]:
+    """Use hybrid-viz videos only for segment policies; otherwise plain MP4s.
+
+    Matches in-training eval: ``is_segment_policy_config`` gates
+    ``hybrid_videos_dir`` vs ``videos_dir``. Callers such as
+    ``lerobot_eval_hybrid_viz`` / checkpoints may still pass a hybrid dir
+    for vanilla ACT; remap it so the live recorder is never attached.
+    """
+    from hybrid_eval.segment import is_segment_policy_config
+
+    cfg = getattr(policy, "config", policy)
+    if hybrid_videos_dir is not None and not is_segment_policy_config(cfg):
+        logging.info(
+            "Policy is not a segment policy; using plain eval videos instead of hybrid-viz."
+        )
+        if videos_dir is None:
+            videos_dir = hybrid_videos_dir
+        hybrid_videos_dir = None
+    return videos_dir, hybrid_videos_dir
+
+
 def _l_spline_torque_enabled(cfg: Any) -> bool:
     return str(getattr(cfg, "l_executor_type", "policy")) == "timed_spline_torque"
 
@@ -674,6 +700,9 @@ def eval_policy(
         Dictionary with metrics and data regarding the rollouts.
     """
     # Hybrid-motion-planner extension (akirakudo901)
+    videos_dir, hybrid_videos_dir = resolve_eval_video_dirs(
+        policy, videos_dir=videos_dir, hybrid_videos_dir=hybrid_videos_dir
+    )
     if max_episodes_rendered > 0 and not videos_dir and hybrid_videos_dir is None:
         raise ValueError("If max_episodes_rendered > 0, videos_dir or hybrid_videos_dir must be provided.")
     # Hybrid-motion-planner extension (akirakudo901)
