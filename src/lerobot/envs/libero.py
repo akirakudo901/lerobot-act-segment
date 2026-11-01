@@ -768,6 +768,7 @@ class LiberoEnv(gym.Env):
         *,
         kp: float | np.ndarray | None = None,
         kd: float | np.ndarray | None = None,
+        hold_after_end_s: float | None = None,
     ) -> None:
         """Worker RPC: rebuild the cubic and ``load_spline`` on the torque controller."""
         from hybrid_eval.execution.waypoint_osc import execution_plan_from_mapping
@@ -793,6 +794,8 @@ class LiberoEnv(gym.Env):
             kwargs["kp"] = kp
         if kd is not None:
             kwargs["kd"] = kd
+        if hold_after_end_s is not None:
+            kwargs["hold_after_end_s"] = hold_after_end_s
         load(spline_from_plan_knots(execution_plan_from_mapping(mapping)), **kwargs)
 
     def close(self):
