@@ -43,6 +43,12 @@ class DatasetConfig:
     return_uint8: bool = False
     streaming: bool = False
     # Augmentation-ready LIBERO train-time transforms (post-load MP shift/relabel/rescale).
+    # Design choice: the handoff-rest options (enable_handoff_rest_segments, handoff_rest_frames,
+    # handoff_l_max_hop_m, handoff_l_prefix_hops) are deliberately NOT fields here. They are
+    # experimental and exist for the rebake only: hybrid-motion-planner's
+    # `hybrid_eval.run_handoff_rest_chained` builds the pause-inserted pieces through them and
+    # exports a rebaked dataset. lerobot_train trains on that export like any other
+    # augmentation-ready dataset, so it must not reach them.
     enable_mp_aug_ready_transforms: bool = False
     mp_shift_max: int = 0
     rescale_mp_actions: bool = True
