@@ -1,0 +1,3 @@
+# tasks/config.yaml: per-project settings, not task state.
+strategy: ../project-level-brainstorming/coding-workflow/feature-strategy/default.md
+types: [feature, bug-fix, refactor, docs]   # extend per project
