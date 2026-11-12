@@ -289,6 +289,20 @@ def _set_collect_tracker_traces(policy: PreTrainedPolicy, rows: Any) -> None:
         setter(rows)
 
 
+def _tracker_trace_row_count(
+    *,
+    write_tracker_trace_plots: bool,
+    max_episodes_rendered: int,
+    n_episodes_rendered: int,
+    num_envs: int,
+    uses_ompl: bool,
+) -> int:
+    """Number of leading VectorEnv rows whose tracker traces to collect (0 = none)."""
+    if not (write_tracker_trace_plots and uses_ompl and max_episodes_rendered > 0):
+        return 0
+    return max(0, min(max_episodes_rendered - n_episodes_rendered, num_envs))
+
+
 def _consume_ompl_tracker_traces(policy: PreTrainedPolicy) -> list[list[Any]]:
     consume = getattr(policy, "consume_ompl_tracker_traces", None)
     if not callable(consume):
@@ -684,6 +698,8 @@ def eval_policy(
     start_seed: int | None = None,
     # Hybrid-motion-planner extension (akirakudo901): directory to store hybrid videos to (overwrites videos_dir when specified)
     hybrid_videos_dir: Path | None = None,
+    # Hybrid-motion-planner extension (akirakudo901): False keeps videos but skips tracker trace plots
+    write_tracker_trace_plots: bool = True,
 ) -> dict:
     """
     Args:
@@ -780,16 +796,14 @@ def eval_policy(
             else None
         )
 
-        n_tracker_trace_rows = 0
         cfg = getattr(policy, "config", None)
-        if (
-            max_episodes_rendered > 0
-            and cfg is not None
-            and _uses_ompl_layer1_rpc(cfg)
-        ):
-            n_tracker_trace_rows = min(
-                max_episodes_rendered - n_episodes_rendered, env.num_envs
-            )
+        n_tracker_trace_rows = _tracker_trace_row_count(
+            write_tracker_trace_plots=write_tracker_trace_plots,
+            max_episodes_rendered=max_episodes_rendered,
+            n_episodes_rendered=n_episodes_rendered,
+            num_envs=env.num_envs,
+            uses_ompl=cfg is not None and _uses_ompl_layer1_rpc(cfg),
+        )
         _set_collect_tracker_traces(
             policy,
             range(n_tracker_trace_rows) if n_tracker_trace_rows > 0 else None,
@@ -1117,6 +1131,7 @@ def eval_main(cfg: EvalPipelineConfig):
             n_episodes=cfg.eval.n_episodes,
             max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
+            write_tracker_trace_plots=cfg.eval.write_tracker_trace_plots,
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )
@@ -1210,6 +1225,7 @@ def eval_one(
     start_seed: int | None,
     # Hybrid-motion-planner extension (akirakudo901): directory for storing hybrid execution videos
     hybrid_videos_dir: Path | None = None,
+    write_tracker_trace_plots: bool = True,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -1227,6 +1243,7 @@ def eval_one(
         start_seed=start_seed,
         # Hybrid-motion-planner extension (akirakudo901)
         hybrid_videos_dir=hybrid_videos_dir,
+        write_tracker_trace_plots=write_tracker_trace_plots,
     )
 
     per_episode = task_result["per_episode"]
@@ -1268,6 +1285,7 @@ def run_one(
     start_seed: int | None,
     # Hybrid-motion-planner extension (akirakudo901): directory for storing hybrid execution videos
     hybrid_videos_dir: Path | None = None,
+    write_tracker_trace_plots: bool = True,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -1299,6 +1317,7 @@ def run_one(
         start_seed=start_seed,
         # Hybrid-motion-planner extension (akirakudo901)
         hybrid_videos_dir=task_hybrid_videos_dir,
+        write_tracker_trace_plots=write_tracker_trace_plots,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -1322,6 +1341,8 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    # Hybrid-motion-planner extension (akirakudo901)
+    write_tracker_trace_plots: bool = True,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1386,6 +1407,7 @@ def eval_policy_all(
         hybrid_videos_dir=hybrid_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        write_tracker_trace_plots=write_tracker_trace_plots,
     )
 
     if max_parallel_tasks <= 1:
