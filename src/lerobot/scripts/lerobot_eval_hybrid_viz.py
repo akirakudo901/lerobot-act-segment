@@ -112,6 +112,7 @@ def eval_hybrid_viz_main(cfg: EvalPipelineConfig):
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
             max_episodes_rendered=cfg.eval.max_episodes_rendered,
+            write_tracker_trace_plots=cfg.eval.write_tracker_trace_plots,
             videos_dir=videos_dir,
             hybrid_videos_dir=hybrid_videos_dir,
             start_seed=cfg.seed,

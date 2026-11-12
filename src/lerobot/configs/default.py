@@ -121,6 +121,9 @@ class EvalConfig:
     use_async_envs: bool = True
     # Maximum number of eval episodes to write as videos (0 disables rendering).
     max_episodes_rendered: int = 10
+    # Hybrid-motion-planner extension: False keeps videos but skips per-plan tracker trace
+    # plots (and their trace collection).
+    write_tracker_trace_plots: bool = True
 
     def __post_init__(self) -> None:
         if self.max_episodes_rendered < 0:

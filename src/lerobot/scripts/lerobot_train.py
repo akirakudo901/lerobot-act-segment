@@ -732,6 +732,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         postprocessor=postprocessor,
                         n_episodes=cfg.eval.n_episodes,
                         max_episodes_rendered=cfg.eval.max_episodes_rendered,
+                        write_tracker_trace_plots=cfg.eval.write_tracker_trace_plots,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
                         **eval_video_kwargs,
