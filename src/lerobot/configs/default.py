@@ -62,6 +62,9 @@ class DatasetConfig:
     ablation_label_mode: str = "none"
     # Last-k E-MP tail length. Used only when ablation_label_mode is mp_terminal_e.
     ablation_terminal_e_k: int = 0
+    # How stored actions become training segments (needs enable_mp_aug_ready_transforms).
+    # ``none`` | ``original_dense`` (every frame, stored action, joined label; T020).
+    ablation_action_mode: str = "none"
     # Optional labels.jsonl override for MP aug-ready training. When unset, the
     # wrapper joins labels from labels_version_root, meta/label_binding.json,
     # export provenance, then parquet frame_label_int.

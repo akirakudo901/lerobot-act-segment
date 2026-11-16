@@ -87,7 +87,8 @@ def _maybe_wrap_mp_aug_ready_dataset(
         "Wrapping augmentation-ready dataset at %s "
         "(mp_shift_max=%d, augment=%s, last_l=%s n=%d, wp_cov=%s, "
         "relabel_l_as_pose_endpoint=%s, ablation_label_mode=%s, "
-        "ablation_terminal_e_k=%s, labels_jsonl=%s, labels_version_root=%s)",
+        "ablation_terminal_e_k=%s, ablation_action_mode=%s, labels_jsonl=%s, "
+        "labels_version_root=%s)",
         dataset_root,
         dataset_cfg.mp_shift_max,
         enable_augmentation,
@@ -97,6 +98,7 @@ def _maybe_wrap_mp_aug_ready_dataset(
         dataset_cfg.relabel_l_as_pose_endpoint,
         dataset_cfg.ablation_label_mode,
         dataset_cfg.ablation_terminal_e_k,
+        dataset_cfg.ablation_action_mode,
         dataset_cfg.labels_jsonl,
         dataset_cfg.labels_version_root,
     )
@@ -115,6 +117,7 @@ def _maybe_wrap_mp_aug_ready_dataset(
         relabel_l_as_pose_endpoint=bool(dataset_cfg.relabel_l_as_pose_endpoint),
         ablation_label_mode=str(dataset_cfg.ablation_label_mode),
         ablation_terminal_e_k=int(dataset_cfg.ablation_terminal_e_k),
+        ablation_action_mode=str(dataset_cfg.ablation_action_mode),
         labels_jsonl=dataset_cfg.labels_jsonl,
         labels_version_root=dataset_cfg.labels_version_root,
         require_matching_labels=bool(dataset_cfg.require_matching_labels),
